@@ -44,7 +44,7 @@ The rule correlates multiple independent signals:
 ```kql
 // ========================================================================
 // LSASS Credential Dumping – L3 Native Detection (Noise-Reduced)
-// Author: Ala Dabat (Alstrum)
+// Author: Ala Dabat 
 // MITRE: T1003.001 (LSASS Dump), T1055 (Process Injection)
 // ========================================================================
 
