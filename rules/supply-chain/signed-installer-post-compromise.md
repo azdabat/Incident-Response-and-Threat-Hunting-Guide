@@ -10,6 +10,18 @@ Signed Installer Post-Install C2 Behaviour is detected using pure native telemet
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
+# Signed Installer Post-Install C2 Behaviour – L3 Native Detection Rule
+
+## Threat Focus
+
+Signed Installer Post-Install C2 Behaviour is detected using pure native telemetry (no external TI) at L3 fidelity.
+
+- Category: supply-chain
+- MITRE: T1195, T1105
+
+## Advanced Hunting Query (MDE / Sentinel)
+
+```kql
 let lookback = 14d;
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
@@ -42,6 +54,13 @@ DeviceProcessEvents
 )
 | where ConfidenceScore >= 3
 | order by Timestamp desc
+```
+
+The query exposes:
+
+- `ConfidenceScore` – behaviour-based strength of the signal.
+- `Severity` – derived from `ConfidenceScore`.
+- `HuntingDirectives` – inline analyst guidance (L3-level) on what to do next.
 ```
 
 The query exposes:
