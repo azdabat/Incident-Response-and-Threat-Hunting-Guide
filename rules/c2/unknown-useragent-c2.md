@@ -10,94 +10,156 @@ Unknown or Rare User-Agent C2 is detected using pure native telemetry (no extern
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// Suspicious Port Threat Hunt — With Full Process Attribution
-// Author: Ala Dabat
+// ===================================================================
+// Unknown or Rare User-Agent C2 — L3 Native Detection Rule
+// Author: Ala Dabat (Alstrum)
+// Version: 2025-11
+// Category: C2
+// MITRE: T1071 (Application Layer Protocol), TA0011 (Command & Control)
+// Purpose: Detect rare / unknown / custom User-Agent headers typically
+//          used by HTTP(S) backdoors, implants, and loaders.
+// Note: Pure native telemetry — no external TI lists.
+// ===================================================================
 
-// ---- Load external CSV of suspicious ports ----
-let SuspiciousPortsData =
-    externaldata(
-        dest_port:int,
-        metadata_comment:string,
-        metadata_confidence:string,
-        metadata_detection_type:string,
-        metadata_link:string,
-        metadata_reference:string
-    )
-    ["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
-    with (format="csv", ignoreFirstRecord=true)
-    | where metadata_confidence != "low";
+// -------------------- Tunables --------------------
+let lookback = 7d;
+let min_occurrences_threshold = 5;       // Rare UAs occur < 5 times globally
+let min_confidence = 85;                 // Medium+ by default
 
-let SuspiciousPortList = toscalar(SuspiciousPortsData | summarize make_set(dest_port));
+// Known legitimate "browsing" processes — penalised in scoring
+let UserAppProcesses = dynamic([
+    "chrome.exe","msedge.exe","firefox.exe","iexplore.exe","brave.exe",
+    "outlook.exe","teams.exe","slack.exe","zoom.exe",
+    "onedrive.exe","dropbox.exe"
+]);
 
-let PortDetails = SuspiciousPortsData
-| project dest_port, metadata_comment, metadata_confidence;
+// Suspicious LOLBIN / loaders / C2 launchers — boost scoring
+let SuspiciousLaunchers = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe",
+    "python.exe","perl.exe","ruby.exe","java.exe","rundll32.exe",
+    "mshta.exe","regsvr32.exe","wscript.exe","cscript.exe",
+    "curl.exe","wget.exe","bitsadmin.exe",
+    "rclone.exe","ssh.exe","plink.exe"
+]);
 
-// ---- Main Hunt ----
+// Patterns associated with custom C2 User-Agents
+let C2UserAgentIndicators = dynamic([
+    "Go-http-client","Python-urllib","Java","curl",
+    "Wget","bot","agent","implant","beacon",
+    "stage","loader","update-check","custom"
+]);
+
+// -------------------- Stage 1: Extract User-Agent telemetry --------------------
+let RawUA =
 DeviceNetworkEvents
-| where RemotePort in (SuspiciousPortList)
-| where not(RemoteIP startswith "10." or RemoteIP startswith "192.168." or RemoteIP startswith "172.")
-| join kind=inner PortDetails on $left.RemotePort == $right.dest_port
-
-// ---- Extract all relevant process telemetry ----
-| extend 
-    Proc = InitiatingProcessFileName,
-    ProcCL = InitiatingProcessCommandLine,
-    ProcSHA256 = InitiatingProcessSHA256,
-    ProcSigner = InitiatingProcessSigner,
-    ProcPath = InitiatingProcessFolderPath,
+| where Timestamp >= ago(lookback)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType == "Public"
+| where RemotePort in (80,443,8080,8443)
+| where isnotempty(UserAgent)
+// Keep full process attribution
+| extend
+    Proc       = InitiatingProcessFileName,
+    ProcCL     = InitiatingProcessCommandLine,
     ParentProc = InitiatingProcessParentFileName,
-    User = InitiatingProcessAccountName
+    Account    = InitiatingProcessAccountName
+| project
+    Timestamp, DeviceId, DeviceName,
+    RemoteIP, RemotePort, RemoteUrl, Protocol,
+    UserAgent,
+    Proc, ProcCL, ParentProc, Account;
 
-// ---- Summaries for triage ----
-| summarize
-    FirstSeen = min(Timestamp),
-    LastSeen = max(Timestamp),
-    Count = count(),
-    SampleProcess = arg_max(Timestamp, Proc),
-    SampleCommand = arg_max(Timestamp, ProcCL),
-    SampleHash = arg_max(Timestamp, ProcSHA256),
-    SampleSigner = arg_max(Timestamp, ProcSigner),
-    SampleParent = arg_max(Timestamp, ParentProc),
-    Users = make_set(User,10)
-  by DeviceName, RemoteIP, RemotePort, metadata_comment, metadata_confidence
+// -------------------- Stage 2: Global UA rarity score --------------------
+let UserAgentStats =
+RawUA
+| summarize UA_GlobalCount = count(), DistinctHosts = dcount(DeviceName)
+  by UserAgent;
 
-// ---- Risk Classification ----
-| extend RiskLevel = case(
-    metadata_confidence == "high", "CRITICAL",
-    metadata_confidence == "medium", "HIGH",
-    "MEDIUM"
-),
-MITRE_Tactics = "TA0011 Command and Control",
-MITRE_Techniques = case(
-    RemotePort == 1080, "T1090 Proxy",
-    RemotePort == 1194, "T1573 Encrypted Channel",
-    "T1071 Application Layer Protocol"
-),
-VT_Link = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+// -------------------- Stage 3: Join UA rarity back to raw data --------------------
+let Enriched =
+RawUA
+| join kind=inner UserAgentStats on UserAgent
+| extend
+    IsRareUserAgent = iif(UA_GlobalCount < min_occurrences_threshold, 1, 0),
+    HasC2Pattern    = iif(UserAgent has_any (C2UserAgentIndicators), 1, 0),
+    IsSuspiciousLauncher = iif(Proc in (SuspiciousLaunchers), 1, 0),
+    IsUserFacingApp = iif(Proc in (UserAppProcesses), 1, 0),
+    UA_Length = strlen(UserAgent),
+    UA_Entropy = strlen(split(UserAgent, ";"))       // basic weirdness marker
+;
 
-// ---- Hunter Directives ----
-| extend HuntingDirectives = pack_array(
-    strcat("1) Investigate executable using port: ", SampleProcess),
-    strcat("2) Parent process: ", SampleParent),
-    strcat("3) Command line: ", SampleCommand),
-    strcat("4) SHA256: ", SampleHash, " | Signer: ", SampleSigner),
-    strcat("5) Review ", tostring(Count), " connections to ", RemoteIP),
-    strcat("6) Port context: ", metadata_comment),
-    strcat("7) VirusTotal IP check: ", VT_Link),
-    "8) Pivot into DeviceProcessEvents for full process tree",
-    "9) Review logon context and isolate if malicious"
+// -------------------- Stage 4: Behavioural scoring (native-only) --------------------
+let Scored =
+Enriched
+| extend BaseScore = 70
+| extend ConfidenceScore =
+    BaseScore
+    + iif(IsRareUserAgent == 1, 15, 0)             // truly unknown UA
+    + iif(HasC2Pattern == 1, 10, 0)                // C2-like markers
+    + iif(IsSuspiciousLauncher == 1, 10, 0)        // launched from LOLBIN/tool
+    - iif(IsUserFacingApp == 1, 15, 0)             // browsers → suppress
+    + iif(UA_Length < 20, 5, 0)                    // unusually short UA = common in implants
+    + iif(UA_Length > 180, 5, 0)                   // overlong UA = obfuscation
+    + iif(UA_Entropy <= 2, 5, 0)                   // too simple (bot-like)
+    + iif(UA_Entropy >= 6, 5, 0)                   // too complex (custom encoding)
+;
+
+// -------------------- Severity & MITRE --------------------
+let Final =
+Scored
+| extend Severity = case(
+        ConfidenceScore >= 95, "High",
+        ConfidenceScore >= 85, "Medium",
+        "Low"
+    ),
+    MITRE_Tactics = "TA0011 (Command & Control)",
+    MITRE_Techniques = "T1071 (HTTP/S User-Agent C2)";
+
+// -------------------- Hunter Directives --------------------
+Final
+| extend ThreatHunterDirectives = strcat(
+    "Severity=", Severity,
+    "; Host=", DeviceName,
+    "; Process=", Proc,
+    "; Parent=", ParentProc,
+    "; RareUA=", tostring(IsRareUserAgent),
+    "; UserAgent=", UserAgent,
+    "; Confidence=", tostring(ConfidenceScore),
+    "; RecommendedNextSteps=",
+        case(
+            Severity == "High",
+                "Likely custom HTTP/S implant with rare User-Agent. Investigate process lineage, review binary signer/hash, isolate host, pivot on RemoteIP and UA across environment, and capture memory if possible.",
+            Severity == "Medium",
+                "Validate business context. Check whether the UA belongs to an update agent or custom application. If not baseline-approved, escalate and pivot to similar UAs across hosts.",
+            "Hunting-only signal. Baseline your environment and tune out known-good rare UAs from internal apps."
+        )
 )
 
-// ---- Final Output (your exact projection) ----
+// -------------------- Final Output --------------------
 | project
-    FirstSeen, LastSeen, DeviceName, RemoteIP, RemotePort, Count,
-    RiskLevel,
-    PortContext = metadata_comment,
-    Confidence = metadata_confidence,
-    SampleProcess, SampleCommand,
-    MITRE_Tactics, MITRE_Techniques, VT_Link, HuntingDirectives
+    Timestamp,
+    DeviceName,
+    Account,
+    Proc,
+    ParentProc,
+    RemoteIP,
+    RemotePort,
+    RemoteUrl,
+    UserAgent,
+    UA_GlobalCount,
+    IsRareUserAgent,
+    HasC2Pattern,
+    IsSuspiciousLauncher,
+    UA_Length,
+    UA_Entropy,
+    ConfidenceScore,
+    Severity,
+    MITRE_Tactics,
+    MITRE_Techniques,
+    ThreatHunterDirectives
+| where ConfidenceScore >= min_confidence
+| order by ConfidenceScore desc, Timestamp desc
 
-| order by RiskLevel desc, Count desc, FirstSeen desc
 ```
 
 The query exposes:
