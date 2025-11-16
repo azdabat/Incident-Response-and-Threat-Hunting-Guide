@@ -3,9 +3,57 @@
 ## Threat Focus
 
 Pass-the-Ticket / Kerberos Ticket Abuse is detected using pure native telemetry (no external TI) at L3 fidelity.
-
 - Category: credential-access
 - MITRE: T1550.003, T1558.003
+
+  ## Pass-the-Ticket (PTT) — L3 Native Detection Rule  
+**Category:** Credential Access / Lateral Movement  
+**MITRE:** T1550.003 (Pass-the-Ticket), T1558.003 (Kerberos Tickets)
+
+Pass-the-Ticket (PTT) is a credential-theft technique where attackers replay, forge, or manipulate Kerberos TGT/TGS tickets to authenticate without needing a password or NTLM hash. Unlike Pass-the-Hash, PTT abuses Kerberos’ trust model and allows an adversary to impersonate users, escalate privileges, or move laterally using valid-looking tickets.
+
+Common PTT attack paths include:
+- Forging tickets with tools such as **Rubeus**, **Mimikatz**, **Kekeo**
+- Injecting `.kirbi` tickets into sessions (`/ptt`)
+- Requesting service tickets for **sensitive SPNs** (cifs/ldap/http/sql/termsrv)
+- Replaying TGS tickets across multiple hosts (cross-host inconsistencies)
+- Abuse of weak encryption types (RC4/DES) during replay
+- Large SPN fan-out from a single account (fast lateral movement sweeps)
+
+This L3 detection rule identifies PTT activity using **native Microsoft telemetry only** (no TI, no signatures). It correlates Kerberos authentication patterns with process behaviour on the originating host, producing a weighted, high-fidelity risk score.
+
+### Detection Logic (Native L3)
+The rule analyses:
+- Kerberos TGT/TGS requests across hosts
+- Cross-host ticket use indicating ticket replay
+- Access to **sensitive SPNs** targeted during privilege escalation
+- Weak/legacy encryption patterns used in forged tickets
+- High-privilege accounts behaving outside their baseline
+- Large SPN diversity from a single identity (sweep behaviour)
+- Evidence of PTT tooling (Rubeus/Mimikatz/etc.) on the same host
+
+### Behavioural Scoring
+Confidence increases when:
+- Sensitive SPNs are accessed unexpectedly  
+- High-value accounts appear on untrusted hosts  
+- Weak encryption (RC4/DES) is used by privileged accounts  
+- Ticket use spans multiple unrelated hosts  
+- Kerberos tooling is observed on the endpoint  
+- SPN fan-out exceeds expected baselines  
+
+The rule maps to **High / Medium / Low** severity based on aggregated signals.
+
+### Value of the Detection
+This analytic reliably uncovers:
+- Kerberos ticket replay
+- Forged TGT/TGS ticket usage
+- Credential theft following LSASS compromise
+- Lateral movement via Kerberos impersonation
+- KRBTGT key-related manipulation indicators
+- Early-stage attempts to escalate into Tier 0 assets
+
+It helps identify advanced tradecraft where attackers bypass passwords entirely, relying instead on ticket tampering, replay, and impersonation to gain or maintain privileged access.  
+
 
 ## Advanced Hunting Query (MDE / Sentinel)
 
