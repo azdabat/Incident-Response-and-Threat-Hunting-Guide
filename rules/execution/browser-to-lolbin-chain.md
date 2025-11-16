@@ -4,147 +4,191 @@
 
 Browser → LOLBIN Execution Chain is detected using pure native telemetry (no external TI) at L3 fidelity.
 
+Rule Logic (Annotated)
+
+Browser → LOLBIN process correlation
+Detects any LOLBIN launched directly or indirectly within 5 minutes of a browser process — common in drive-by attacks, JS droppers, weaponized HTA, malicious downloads.
+
+LOLBIN Enumeration
+Covers PowerShell, rundll32, regsvr32, mshta, script hosts, cmd, certutil, bitsadmin, msiexec.
+
+Encoded & Base64 payload detection
+Detects -enc, -encodedcommand, embedded Base64 stagers.
+
+Download cradle detection
+Flags IWR, IRM, curl/wget, Net.WebClient — typical for payload retrieval.
+
+Suspicious download-origin execution
+Execution from Downloads, Users\AppData, Temp — common malware staging locations.
+
+LOLBIN chaining detection
+Classic attacker pattern: mshta → rundll32 → powershell.
+
+Defense evasion
+Flags scripts attempting MpPreference tampering.
+
+Weighted scoring
+Browser origin + encoded payload + download cradle + LOLBIN chain = High severity.
+
+L3 directives
+Provides immediate, SOC-ready action steps: tree pivot, URL investigation, isolation, cross-alert correlation.
+
 - Category: execution
 - MITRE: T1203, T1059, T1218
 
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// ===========================================================
-// Vulnerable / Malicious Driver Load (LOLBIN-Chained) – L3 Detection
-// Author: Ala Dabat
-// MITRE: T1068, T1547.006, T1574.002, T1218
-// Combines LOLDrivers.io external TI + native behavioural analysis
-// ===========================================================
+// =====================================================
+// Browser → LOLBIN Execution Chain – L3 Native Detection
+// Author: Ala Dabat | Version: 2025-11
+// Detects browser-originated process chains leading to LOLBIN execution,
+// a common vector in phishing, drive-by downloads, and initial access.
+// MITRE: T1203, T1059, T1218
+// =====================================================
 
 let lookback = 14d;
 
-// ---------------------------------------------
-// 1. External Threat Intel – LOLDrivers.io CSV
-// ---------------------------------------------
-let VulnerableDriverData = externaldata (
-    Id:string, Author:string, Created:string, Command:string, Description:string,
-    Usecase:string, Category:string, Privileges:string, MitreID:string,
-    OperatingSystem:string, Resources:string, DriverInfo:string, ContactPerson:string,
-    HandleReference:string, DetectionMethod:string, MD5_Hashes:string, SHA1_Hashes:string,
-    SHA256_Hashes:string, PublisherInfo:string, CompanyInfo:string, VulnerabilityDetails:string,
-    MD5_Authentihash:string, SHA256_Authentihash:string, SHA1_Authentihash:string,
-    VerificationStatus:string, TagsInfo:string
-) ["https://www.loldrivers.io/api/drivers.csv"]
-with (format="csv", ignoreFirstRecord=true);
+// -------------------------------------------
+// 1. Define browser parents + LOLBIN children
+// -------------------------------------------
+let Browsers = dynamic([
+    "chrome.exe", "msedge.exe", "firefox.exe",
+    "iexplore.exe", "brave.exe", "opera.exe"
+]);
 
-// Normalize SHA256 from TI feed
-let VulnerableDriversSHA256 =
-    VulnerableDriverData
-    | extend IndividualSHA256 = split(SHA256_Hashes, ",")
-    | mv-expand IndividualSHA256
-    | where isnotempty(IndividualSHA256)
-    | extend NormalizedSHA256 = trim(" ", tolower(IndividualSHA256))
-    | project NormalizedSHA256, Category, Description, Author, TagsInfo, DriverInfo, Privileges, MitreID;
+let LOLBINs = dynamic([
+    "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe",
+    "cmd.exe", "certutil.exe", "bitsadmin.exe", "msiexec.exe"
+]);
 
-// ---------------------------------------------------
-// 2. Native Telemetry – Loaded Drivers (MDE)
-// ---------------------------------------------------
-let LoadedDrivers =
-DeviceEvents
-| where Timestamp >= ago(lookback)
-| where ActionType has "DriverLoad"
-| extend NormalizedDeviceSHA256 = trim(" ", tolower(SHA256))
-| extend FilePath = tostring(AdditionalFields.FilePath)
-| extend FileName = tostring(AdditionalFields.FileName);
-
-// ---------------------------------------------------
-// 3. Join Native Driver Loads against TI Feed
-// ---------------------------------------------------
-let DriverHits =
-LoadedDrivers
-| join kind=inner VulnerableDriversSHA256
-    on $left.NormalizedDeviceSHA256 == $right.NormalizedSHA256
-| project Timestamp, DeviceName, DeviceId,
-          FileName, FilePath,
-          NormalizedDeviceSHA256,
-          Category, Description, Author, TagsInfo, DriverInfo, Privileges, MitreID;
-
-// ---------------------------------------------------
-// 4. Add Behavioural Context (LOLBIN → Driver Load)
-// ---------------------------------------------------
-let SuspiciousParents = dynamic(["powershell.exe","cmd.exe","cscript.exe","wscript.exe","mshta.exe","rundll32.exe","psexec.exe","certutil.exe","regsvr32.exe"]);
-
-// Correlate with process tree activity in last 60 seconds
-let ProcContext =
+// -------------------------------------------
+// 2. Select LOLBIN executions
+// -------------------------------------------
+let LolbinExec =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName in (SuspiciousParents)
-| project ProcTime=Timestamp, DeviceName, AccountName,
-          SuspiciousParent = FileName,
-          ProcessCommandLine;
+| where FileName in~ (LOLBINs)
+| extend Cmd = tostring(ProcessCommandLine);
 
-// Join process ancestry to the driver loads
-DriverHits
-| join kind=leftouter ProcContext on DeviceName
-| extend ParentContext = iif(isnotempty(SuspiciousParent), 1, 0)
+// -------------------------------------------
+// 3. Select browser-origin executions (pivot on parents)
+// -------------------------------------------
+let BrowserParents =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (Browsers)
+| project ParentTime = Timestamp,
+          DeviceId, DeviceName,
+          BrowserProc = FileName,
+          BrowserCommandLine = ProcessCommandLine,
+          InitiatingProcessId = ProcessId;
 
-// ---------------------------------------------------
-// 5. Confidence Scoring (Hybrid TI + Behaviour)
-// ---------------------------------------------------
+// -------------------------------------------
+// 4. Join LOLBIN executions to browser parents
+// -------------------------------------------
+LolbinExec
+| join kind=leftouter BrowserParents on DeviceId
+| where ParentTime <= Timestamp
+      and Timestamp <= ParentTime + 5m // chain window
+| extend FromBrowser = iif(isnotempty(BrowserProc), 1, 0)
+
+// -------------------------------------------
+// 5. Deep behavior scoring
+// -------------------------------------------
+
+// Encoded/obfuscated payloads
+| extend HasEncoded = Cmd has_any ("-enc ", "-encodedcommand", "-e ")
+| extend HasBase64 = Cmd has_any ("FromBase64String", " JAB", "SQBvAHUAdA")
+
+// Staged script execution
+| extend HasIEX = Cmd has_any ("iex ", "Invoke-Expression", "Invoke-Command")
+
+// Download cradles
+| extend HasCradle =
+      Cmd has_any ("iwr", "Invoke-WebRequest", "curl ", "wget ", "Invoke-RestMethod")
+
+// Suspicious file origin (downloaded stuff)
+| extend HasDownloadPath =
+      FolderPath has_any (@"\Users\", @"\Downloads\", @"\AppData\", @"\Temp\")
+
+// Secondary LOLBIN chains (rundll32 → powershell, etc.)
+| extend ChildIsLOLChain =
+      Cmd has_any ("javascript:", "vbscript:", "mshta", "regsvr32 /s", "rundll32")
+
+// Defense evasion
+| extend HasDefenseTamper =
+      Cmd has_any ("Set-MpPreference", "DisableRealtimeMonitoring", "Add-MpPreference")
+
+// Weighted scoring
 | extend ConfidenceScore =
-    0
-    + 10                                    // matching known vulnerable driver via TI feed
-    + iif(ParentContext == 1, 4, 0)         // launched near suspicious LOLBIN execution
-    + iif(Category has "Exploit", 2, 0)     // exploit-enabling drivers
-    + iif(Privileges has "Kernel", 2, 0)    // kernel-level escalation
-    + iif(FilePath has_any ("Temp","AppData","Users","Downloads"), 2, 0) // loaded from user writable dir
+      0
+      + iif(FromBrowser == 1, 4, 0)                                // browser to LOLBIN
+      + iif(HasEncoded, 3, 0)                                      // encoded command
+      + iif(HasBase64, 2, 0)                                       // base64 payload
+      + iif(HasCradle, 3, 0)                                       // download cradle
+      + iif(HasIEX, 3, 0)                                          // inline execution
+      + iif(HasDefenseTamper, 3, 0)                                // tampering
+      + iif(HasDownloadPath, 2, 0)                                 // downloaded file origin
+      + iif(ChildIsLOLChain, 3, 0);                                // LOLBIN → LOLBIN chaining
 
-// ---------------------------------------------------
-// 6. Reason for Analyst (Explain scoring)
-// ---------------------------------------------------
+// -------------------------------------------
+// 6. Reason summary
+// -------------------------------------------
 | extend Reason = strcat(
-    "Driver confirmed from LOLDrivers TI feed: ", FileName, ". ",
-    "Category=", Category, ". ",
-    "Privileges=", Privileges, ". ",
-    iif(ParentContext == 1, strcat("Execution preceded by LOLBIN: ", SuspiciousParent, ". "), ""),
-    iif(FilePath has_any ("Temp","AppData","Users","Downloads"),
-        strcat("Driver loaded from non-standard directory (", FilePath, "). "), "")
+      iif(FromBrowser == 1, "Browser-origin execution; ", ""),
+      iif(HasEncoded, "Encoded payload; ", ""),
+      iif(HasBase64, "Base64 payload; ", ""),
+      iif(HasCradle, "Download cradle invoked; ", ""),
+      iif(HasIEX, "IEX/inline execution; ", ""),
+      iif(ChildIsLOLChain, "LOLBIN-to-LOLBIN chaining; ", ""),
+      iif(HasDefenseTamper, "Defender tampering attempt; ", ""),
+      iif(HasDownloadPath, "Suspicious download/execution directory; ", "")
 )
 
-// ---------------------------------------------------
-// 7. Severity Mapping
-// ---------------------------------------------------
+// -------------------------------------------
+// 7. Severity
+// -------------------------------------------
 | extend Severity = case(
-    ConfidenceScore >= 12, "High",
-    ConfidenceScore >= 8,  "Medium",
-    ConfidenceScore >= 3,  "Low",
-    "Informational"
+      ConfidenceScore >= 12, "High",
+      ConfidenceScore >= 8,  "Medium",
+      ConfidenceScore >= 5,  "Low",
+      "Informational"
 )
 
-// ---------------------------------------------------
-// 8. L3 Hunter Directives
-// ---------------------------------------------------
+// -------------------------------------------
+// 8. L3 Hunting Directives
+// -------------------------------------------
 | extend HuntingDirectives = strcat(
     "Severity=", Severity,
     "; Device=", DeviceName,
-    "; Driver=", FileName,
-    "; SHA256=", NormalizedDeviceSHA256,
-    "; Category=", Category,
+    "; User=", AccountName,
+    "; Browser=", tostring(BrowserProc),
+    "; LOLBIN=", FileName,
     "; Reason=", Reason,
     "; RecommendedNextSteps=",
     case(
         Severity == "High",
-            "Isolate device immediately. Vulnerable driver load strongly correlated with LOLBIN execution; investigate privilege escalation via kernel exploits, check for Bring-Your-Own-Vulnerable-Driver (BYOVD) attack patterns, triage kernel callbacks & recent handle access.",
+           "Investigate full process tree. Extract downloaded file if any. Review browser history and downloads. Check for credential harvesting scripts, LSASS access, persistence creation. Isolate if malicious.",
         Severity == "Medium",
-            "Review driver file origin & execution chain. Validate if this driver is expected. Pivot around process activity ±5 mins to check for exploitation or persistence.",
+           "Review downloaded content and command-line arguments. Check email/URL origin. Inspect ±24h for related alerts.",
         Severity == "Low",
-            "Driver may be custom or legacy. Validate metadata, compare with known-good baselines, and confirm if TI mapping is accurate.",
-        "Context signal only; combine with higher-confidence detections."
+           "Baseline if known admin tools triggered it. Validate user activity.",
+        "Context only."
     )
 )
 
-// ---------------------------------------------------
+// -------------------------------------------
 // 9. Final output
-// ---------------------------------------------------
-| where ConfidenceScore >= 3
+// -------------------------------------------
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          BrowserProc, BrowserCommandLine,
+          FileName, Cmd, FolderPath,
+          ConfidenceScore, Severity,
+          Reason, HuntingDirectives
+| where ConfidenceScore >= 5
 | order by Timestamp desc
-
 ```
 
 The query exposes:
