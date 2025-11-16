@@ -10,38 +10,55 @@ ETW / AMSI Tampering Behaviour is detected using pure native telemetry (no exter
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-let lookback = 14d;
-DeviceProcessEvents
-| where Timestamp >= ago(lookback)
-| extend Cmd = tostring(ProcessCommandLine)
-| extend ConfidenceScore = 4
-| extend Reason = "etw-amsi-tamper – baseline native behavioural detection; tune conditions to match your environment."
-| project Timestamp, DeviceId, DeviceName, AccountName,
-          FileName, Cmd,
-          InitiatingProcessFileName, InitiatingProcessCommandLine,
-          ConfidenceScore, Reason
+// =============================================================================
+// LOLBins with Defense Evasion Patterns (AMSI bypass/memory dumping)
+// Author: Ala Dabat 
+// Purpose: Detect living-off-the-land binaries used for defense evasion
+// Hunter Directive: Analyze LOLBin usage for AMSI bypass, memory dumping, or service disruption
+// =============================================================================
 
-| extend Severity = case(
-    ConfidenceScore >= 8, "High",
-    ConfidenceScore >= 5, "Medium",
-    ConfidenceScore >= 3, "Low",
-    "Informational"
-)
-| extend HuntingDirectives = strcat(
-    "Severity=", Severity,
-    "; Device=", tostring(DeviceName),
-    "; User=", tostring(AccountName),
-    "; CoreReason=", Reason,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High", "Isolate host, collect full triage (process, file, network, identity), check for lateral movement and credential theft, notify IR lead.",
-        Severity == "Medium", "Validate admin/change context, pivot ±24h on the same device/user, correlate with other detections, decide on containment.",
-        Severity == "Low", "Baseline this behaviour for this asset/user, treat as a weak hunting signal, consider tuning or elevating if seen with other anomalies.",
-        "Use as contextual signal only; combine with higher-confidence rules."
+let Lookback = 7d;
+let LoLBinCmds = dynamic(["rundll32.exe", "regsvr32.exe", "powershell.exe", "pwsh.exe", "mshta.exe", "wmic.exe", "taskkill.exe", "sc.exe", "net.exe", "certutil.exe", "bitsadmin.exe"]);
+let SuspiciousIndicators = dynamic(["comsvcs.dll", "MiniDump", "AmsiUtils", "AmsiScanBuffer", "amsiInitFailed", "-enc", "IEX(", "DownloadString", "FromBase64String", "net stop", "sc stop", "taskkill", "Stop-Service"]);
+
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where FileName in (LoLBinCmds)
+| where ProcessCommandLine has_any (SuspiciousIndicators)
+| extend 
+    IndicatorType = case(
+        ProcessCommandLine contains "comsvcs.dll" or ProcessCommandLine contains "MiniDump", "LSASS Memory Dumping",
+        ProcessCommandLine contains "AmsiUtils" or ProcessCommandLine contains "AmsiScanBuffer", "AMSI Bypass Attempt", 
+        ProcessCommandLine contains "-enc" or ProcessCommandLine contains "FromBase64String", "Encoded Command",
+        ProcessCommandLine contains "net stop" or ProcessCommandLine contains "sc stop", "Service Termination",
+        "Suspicious LOLBin Usage"
+    ),
+    RiskScore = case(
+        ProcessCommandLine contains "comsvcs.dll", 10,
+        ProcessCommandLine contains "AmsiScanBuffer", 9,
+        ProcessCommandLine contains "-enc", 8,
+        ProcessCommandLine contains "net stop", 7,
+        5
     )
+| extend HunterDirective = strcat(
+    "HIGH PRIORITY: Investigate ", FileName, " with ", IndicatorType, " indicator. ",
+    "Command: ", substring(ProcessCommandLine, 0, 200), 
+    ". Parent process: ", InitiatingProcessFileName,
+    ". User: ", InitiatingProcessAccountUpn,
+    ". Check for successful execution and review process tree for additional malicious activity."
 )
-| where ConfidenceScore >= 3
-| order by Timestamp desc
+| project 
+    Timestamp,
+    DeviceName,
+    ProcessName = FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessAccountUpn,
+    IndicatorType,
+    RiskScore,
+    HunterDirective,
+    RuleName = "LOLBins with Defense Evasion Patterns"
+| order by RiskScore desc, Timestamp desc;
 ```
 
 The query exposes:
