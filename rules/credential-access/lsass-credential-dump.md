@@ -12,7 +12,7 @@ LSASS Credential Dumping Behaviour is detected using pure native telemetry (no e
 ```kql
 // ===========================================
 // LSASS Credential Dumping – L3 Native Detection
-// Author: Ala Dabat (Alstrum)
+// Author: Ala Dabat 
 // MITRE: T1003.001, T1055
 // ===========================================
 
