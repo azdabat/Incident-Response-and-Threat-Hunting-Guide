@@ -10,38 +10,64 @@ SAM/SECURITY Hive Export is detected using pure native telemetry (no external TI
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
+// ==========================================================
+// SAM / SECURITY / SYSTEM Hive Extraction – L3 Native Rule
+// Author: Ala Dabat
+// MITRE: T1003.002 (Registry Hives), T1003.006, T1059, T1055
+// Behaviour-based detection of all modern hive theft vectors
+// ==========================================================
+
 let lookback = 14d;
+
+// Known tools and masquerades used for hive extraction
+let HiveTools = dynamic([
+    "reg.exe","regedit.exe","powershell.exe","cmd.exe","wmic.exe",
+    "vssadmin.exe","diskshadow.exe","mimikatz.exe","rubeus.exe",
+    "lsassy.exe","secretsdump.py","impacket-secretsdump.exe",
+    "dllhost.exe","rundll32.exe"
+]);
+
+// Suspicious file extensions attackers use when renaming hive dumps
+let SusExt = dynamic([".tmp",".bak",".bin",".dat",".save",".old",".dmp"]);
+
+// Registry hives of interest
+let HivePaths = dynamic([
+    "\\System32\\config\\sam",
+    "\\System32\\config\\system",
+    "\\System32\\config\\security"
+]);
+
+// Registry export keywords
+let ExportKeywords = dynamic([
+    "reg save","save hklm","reg export","hklm\\sam","hklm\\system","hklm\\security"
+]);
+
+// 1. Process-based hive extraction patterns
+let Proc =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | extend Cmd = tostring(ProcessCommandLine)
-| extend ConfidenceScore = 4
-| extend Reason = "sam-security-hive-export – baseline native behavioural detection; tune conditions to match your environment."
-| project Timestamp, DeviceId, DeviceName, AccountName,
-          FileName, Cmd,
-          InitiatingProcessFileName, InitiatingProcessCommandLine,
-          ConfidenceScore, Reason
+| extend IsHiveTool = iif(FileName in (HiveTools), 1, 0)
+| extend ExportCommand = iif(Cmd has_any (ExportKeywords), 1, 0)
+| extend SuspiciousParent =
+    iif(InitiatingProcessFileName in ("powershell.exe","cmd.exe","rundll32.exe","mshta.exe","cscript.exe"), 1, 0)
+| where IsHiveTool == 1 or ExportCommand == 1 or Cmd has_any (HivePaths)
+| project Timestamp, DeviceName, DeviceId, AccountName,
+          FileName, Cmd, InitiatingProcessFileName,
+          IsHiveTool, ExportCommand, SuspiciousParent;
 
-| extend Severity = case(
-    ConfidenceScore >= 8, "High",
-    ConfidenceScore >= 5, "Medium",
-    ConfidenceScore >= 3, "Low",
-    "Informational"
-)
-| extend HuntingDirectives = strcat(
-    "Severity=", Severity,
-    "; Device=", tostring(DeviceName),
-    "; User=", tostring(AccountName),
-    "; CoreReason=", Reason,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High", "Isolate host, collect full triage (process, file, network, identity), check for lateral movement and credential theft, notify IR lead.",
-        Severity == "Medium", "Validate admin/change context, pivot ±24h on the same device/user, correlate with other detections, decide on containment.",
-        Severity == "Low", "Baseline this behaviour for this asset/user, treat as a weak hunting signal, consider tuning or elevating if seen with other anomalies.",
-        "Use as contextual signal only; combine with higher-confidence rules."
-    )
-)
-| where ConfidenceScore >= 3
-| order by Timestamp desc
+// 2. Raw file access to the actual hive files (even renamed)
+let HiveFileAccess =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| extend LPath = tolower(FolderPath)
+| where LPath has @"\system32\config\" 
+| where FileName contains_any ("sam","system","security") 
+      or FileName endswith_any (SusExt)
+| where ActionType in ("FileCopied","FileCreated","FileModified","FileDeleted")
+| project HiveTime=Timestamp, DeviceName, DeviceId,
+          HiveFileName=FileName, H
+
 ```
 
 The query exposes:
