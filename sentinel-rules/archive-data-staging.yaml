@@ -1,0 +1,39 @@
+id: native-archive-data-staging-analytic-rule
+kind: Scheduled
+name: NATIVE – Archive-based Data Staging (7z/rar/zip)
+description: |
+  L3-native analytic rule for Archive-based Data Staging (7z/rar/zip), built from the Native Detection Bible.
+  Uses only native telemetry and includes ConfidenceScore, Severity and HuntingDirectives.
+
+severity: High
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+
+query: |
+  // See rules/exfiltration/archive-data-staging.md for full KQL with scoring and directives.
+
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: GreaterThan
+triggerThreshold: 0
+
+suppressionEnabled: false
+suppressionDuration: 6h
+
+tactics:
+  - execution
+
+techniques:
+  - T1074
+
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: DeviceName
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AccountName

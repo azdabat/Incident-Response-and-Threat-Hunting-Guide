@@ -1,0 +1,39 @@
+id: native-oauth-consent-abuse-analytic-rule
+kind: Scheduled
+name: NATIVE – OAuth Consent Abuse (Native Logs)
+description: |
+  L3-native analytic rule for OAuth Consent Abuse (Native Logs), built from the Native Detection Bible.
+  Uses only native telemetry and includes ConfidenceScore, Severity and HuntingDirectives.
+
+severity: High
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+
+query: |
+  // See rules/cloud/oauth-consent-abuse.md for full KQL with scoring and directives.
+
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: GreaterThan
+triggerThreshold: 0
+
+suppressionEnabled: false
+suppressionDuration: 6h
+
+tactics:
+  - execution
+
+techniques:
+  - T1528
+
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: DeviceName
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AccountName

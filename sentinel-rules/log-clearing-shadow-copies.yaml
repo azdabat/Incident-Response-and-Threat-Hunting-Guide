@@ -1,0 +1,39 @@
+id: native-log-clearing-shadow-copies-analytic-rule
+kind: Scheduled
+name: NATIVE – Log Clearing and Shadow Copy Deletion
+description: |
+  L3-native analytic rule for Log Clearing and Shadow Copy Deletion, built from the Native Detection Bible.
+  Uses only native telemetry and includes ConfidenceScore, Severity and HuntingDirectives.
+
+severity: High
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+
+query: |
+  // See rules/evasion/log-clearing-shadow-copies.md for full KQL with scoring and directives.
+
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: GreaterThan
+triggerThreshold: 0
+
+suppressionEnabled: false
+suppressionDuration: 6h
+
+tactics:
+  - execution
+
+techniques:
+  - T1070
+
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: DeviceName
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AccountName

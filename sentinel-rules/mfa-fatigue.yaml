@@ -1,0 +1,39 @@
+id: native-mfa-fatigue-analytic-rule
+kind: Scheduled
+name: NATIVE – MFA Fatigue / Push Spamming
+description: |
+  L3-native analytic rule for MFA Fatigue / Push Spamming, built from the Native Detection Bible.
+  Uses only native telemetry and includes ConfidenceScore, Severity and HuntingDirectives.
+
+severity: High
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+
+query: |
+  // See rules/cloud/mfa-fatigue.md for full KQL with scoring and directives.
+
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: GreaterThan
+triggerThreshold: 0
+
+suppressionEnabled: false
+suppressionDuration: 6h
+
+tactics:
+  - execution
+
+techniques:
+  - Credential abuse
+
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: DeviceName
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AccountName

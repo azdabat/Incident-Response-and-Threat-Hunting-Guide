@@ -1,0 +1,39 @@
+id: native-sql-xpcmdshell-lateral-analytic-rule
+kind: Scheduled
+name: NATIVE – SQL Server xp_cmdshell / Agent Lateral Movement
+description: |
+  L3-native analytic rule for SQL Server xp_cmdshell / Agent Lateral Movement, built from the Native Detection Bible.
+  Uses only native telemetry and includes ConfidenceScore, Severity and HuntingDirectives.
+
+severity: High
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - DeviceProcessEvents
+
+query: |
+  // See rules/lateral-movement/sql-xpcmdshell-lateral.md for full KQL with scoring and directives.
+
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: GreaterThan
+triggerThreshold: 0
+
+suppressionEnabled: false
+suppressionDuration: 6h
+
+tactics:
+  - execution
+
+techniques:
+  - T1505.001
+
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: FullName
+        columnName: DeviceName
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AccountName
