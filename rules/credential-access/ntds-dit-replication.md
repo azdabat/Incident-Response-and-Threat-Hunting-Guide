@@ -89,6 +89,7 @@ perm_abuse
 ```
 
 Additional Query for NTDS.dit exfiltration, Kerberos attack vectors.
+
 ```
 // ===========================================================================
 // NTDS.dit Replication / DCSync + ShadowCopy Exfil — L3 Native Detection Rule
@@ -184,7 +185,6 @@ DeviceFileEvents
     FileName;
 
 // -------------------- Stage 5 —
-
 ```
 | Attack                                                       | Coverage        | Why                                               |
 | ------------------------------------------------------------ | --------------- | ------------------------------------------------- |
