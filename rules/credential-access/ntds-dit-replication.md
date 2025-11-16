@@ -88,6 +88,118 @@ perm_abuse
 
 ```
 
+Additional Query for NTDS.dit exfiltration, Kerberos attack vectors.
+```
+// -------------------------------------------
+// NTDS / Golden Ticket Detection with MISP TI and Correlation
+// Author: Ala Dabat 2024
+// -------------------------------------------
+
+// Lookback window
+let lookback = 7d;
+
+// Suspicious NTDS / VSS commands
+let suspicious_commands = dynamic(["create full","ntds","ntdsutil","ac i ntds"]);
+let vssadmin_vector = dynamic(["create shadow","/for=C","delete shadows","shadowcopy"]);
+let ntds_paths = dynamic(@["\\ntds.dit","\\ntds\\","\\AppData\\","\\Downloads\\","\\Desktop\\","\\Temp\\","\\Users\\Public\\","\\windows\\"]);
+
+// Load MISP indicators from Sentinel ThreatIntelligenceIndicator table
+let MISPIndicators = ThreatIntelligenceIndicator
+| where IndicatorType in ("FileHash","FileName","IP","URL","Registry")
+| project IndicatorType, IndicatorValue = Indicator, TI_Score = 100;
+
+
+
+// ----------------------------
+// 1️ Suspicious NTDS-related processes - MISP Integration
+// ----------------------------
+let SuspiciousProcesses = DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in ("ntdsutil.exe","vssadmin.exe","esentutl.exe","wbadmin.exe","python.exe","powershell.exe","mimikatz.exe","secretsdump.py")
+| where ProcessCommandLine has_any (suspicious_commands)
+    or InitiatingProcessCommandLine has_any(suspicious_commands)
+    or ProcessCommandLine has_any(vssadmin_vector)
+| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName, InitiatingProcessAccountName, ProcessId
+| extend IndicatorType="Process", Score=40;
+
+// Enrich processes with MISP FileName / SHA1
+let SuspiciousProcessesEnriched = SuspiciousProcesses
+| join kind=leftouter (
+    MISPIndicators
+    | where IndicatorType in ("FileName","FileHash")
+    | project TI_Indicator = IndicatorValue, TI_Type = IndicatorType, TI_Score
+) on $left.FileName == $right.TI_Indicator
+| extend TotalScore = Score + coalesce(TI_Score,0);
+
+// ----------------------------
+// 2️ Suspicious NTDS file access / copies
+// ----------------------------
+let SuspiciousFiles = DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName has_cs "ntds.dit" or FolderPath has_any (ntds_paths)
+| project Timestamp, DeviceName, FolderPath, FileName, ActionType, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+| extend IndicatorType="File", Score=30;
+
+// Enrich files with MISP FileName / SHA1
+let SuspiciousFilesEnriched = SuspiciousFiles
+| join kind=leftouter (
+    MISPIndicators
+    | where IndicatorType in ("FileName","FileHash")
+    | project TI_Indicator = IndicatorValue, TI_Type = IndicatorType, TI_Score
+) on $left.FileName == $right.TI_Indicator
+| extend TotalScore = Score + coalesce(TI_Score,0);
+
+// ----------------------------
+// 3️ Suspicious network exfil events
+// ---------------------------
+let SuspiciousNetwork = DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessCommandLine has_any ("Invoke-NinjaCopy","secretsdump.py","secret_dump","A c i ntds","Invoke-Mimikatz")
+| project Timestamp, DeviceName, RemoteIP, RemotePort, BytesSent, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+| extend IndicatorType="Network", Score=25;
+
+// Enrich network events with MISP IP / URL
+let SuspiciousNetworkEnriched = SuspiciousNetwork
+| join kind=leftouter (
+    MISPIndicators
+    | where IndicatorType in ("IP","URL")
+    | project TI_Indicator = IndicatorValue, TI_Type = IndicatorType, TI_Score
+) on $left.RemoteIP == $right.TI_Indicator or $left.InitiatingProcessCommandLine has $right.TI_Indicator
+| extend TotalScore = Score + coalesce(TI_Score,0);
+
+// ----------------------------
+// 4️ Correlation: Boost network score if following suspicious process/file
+// ----------------------------
+let CorrelatedNetwork = SuspiciousNetworkEnriched
+| join kind=inner (
+    union(SuspiciousProcessesEnriched, SuspiciousFilesEnriched)
+    | project DeviceName, IndicatorType, Timestamp, TotalScore
+) on DeviceName
+| where Timestamp >= Timestamp1 and Timestamp <= Timestamp1 + 15m  // network within 15m of process/file
+| extend TotalScore = TotalScore + 20  // boost correlated events
+
+// ----------------------------
+// 5️ Combine all indicators
+// ----------------------------
+let AllIndicators = union(SuspiciousProcessesEnriched, SuspiciousFilesEnriched, CorrelatedNetwork)
+| extend Time = Timestamp;
+
+// ----------------------------
+// 6️ Summarize by Device + File/Process
+// ----------------------------
+AllIndicators
+| summarize TotalScore = sum(TotalScore),
+            Indicators = make_set(IndicatorType),
+            FirstSeen = min(Time),
+            LastSeen = max(Time),
+            Samples = make_list(pack_all())
+            by DeviceName, FileName, InitiatingProcessFileName
+| where TotalSco
+
+
+```
+
+
 The query exposes:
 
 - `ConfidenceScore` – behaviour-based strength of the signal.
