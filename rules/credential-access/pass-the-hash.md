@@ -3,9 +3,50 @@
 ## Threat Focus
 
 Pass-the-Hash Pattern (NTLM) is detected using pure native telemetry (no external TI) at L3 fidelity.
-
 - Category: credential-access
 - MITRE: T1550.002
+
+  ## Pass-the-Hash (NTLM Network Lateral) — L3 Native Detection Rule
+**Category:** Credential-Access / Lateral Movement  
+**MITRE:** T1550.002 (Pass-the-Hash), T1078 (Valid Accounts)
+
+This rule detects NTLM-based lateral movement using *native telemetry only*, with no external threat intelligence or signatures. Pass-the-Hash allows an adversary to authenticate to remote systems using stolen NTLM hashes instead of plaintext credentials. This typically follows LSASS credential theft and is frequently observed during internal recon, lateral movement, or privilege escalation.
+
+### Detection Approach
+The rule uses `IdentityLogonEvents` to identify NTLM “Resource Access” logons that originate from non-DC endpoints. These events are aggregated by source host and account to analyse:
+
+- Number of **unique target hosts** accessed via NTLM  
+- Volume of NTLM traffic over short time windows  
+- Use of **privileged accounts** (e.g., admin, svc accounts)  
+- NTLM authentication from endpoints that rarely generate it  
+- Patterns consistent with credential misuse or automated sweeps  
+
+### Behavioural Scoring (Native L3)
+A weighted scoring model increases confidence when:
+- The same workstation touches many NTLM targets  
+- NTLM activity bursts occur in short time windows  
+- Administrative or service accounts authenticate from non-DC hosts  
+- NTLM usage is inconsistent with the device’s expected behaviour  
+
+Severity is mapped from the total confidence score (High, Medium, Low).
+
+### What This Rule Detects
+- Classic Pass-the-Hash lateral traversal  
+- SMB / PsExec-style NTLM authentication chains  
+- Misuse of high-privilege accounts from compromised workstations  
+- NTLM sweeps across servers during internal pivoting  
+- Stolen credentials being replayed from unexpected hosts  
+
+### Usage Notes
+A small amount of noise may originate from:
+- Legitimate admin jump hosts  
+- Backup/orchestration systems  
+- Patch automation frameworks  
+
+These baselines can be safely allowlisted at the analytics-rule level.
+
+This detection is fully native, environment-aware after tuning, and provides reliable high-fidelity alerts for credential misuse and NTLM-based lateral movement activity.
+
 
 ## Advanced Hunting Query (MDE / Sentinel)
 
