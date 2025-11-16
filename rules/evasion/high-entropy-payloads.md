@@ -14,7 +14,7 @@ High-Entropy Payload Drops (Polymorphic) is detected using pure native telemetry
 // High-Entropy / Polymorphic Payload Drops – L3 Detection
 // Category: defense-evasion / execution
 // MITRE: T1027 (Obfuscated/Encrypted), T1204, T1059
-// Author: Ala Dabat (Alstrum)
+// Author: Ala Dabat 
 // ======================================================
 
 let lookback = 14d;
