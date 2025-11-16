@@ -208,3 +208,144 @@ The query exposes:
 - `ConfidenceScore` – behaviour-based strength of the signal.
 - `Severity` – derived from `ConfidenceScore`.
 - `HuntingDirectives` – inline analyst guidance (L3-level) on what to do next.
+
+Companion Rule:
+
+Brute-force / spraying → lateral movement
+Multiple SMB failures → a successful connection
+Even with no PsExec/WMI/SC
+Even with renamed binaries
+Even if attacker uses built-in Windows tools
+Credential compromise leading to lateral access
+Succeeds even if attacker never writes to ADMIN$
+Succeeds even with direct remote execution (cmd /c copy, powershell copy, custom tools)
+Tool staging without service creation
+Dropping malware into ADMIN$/C$ without starting a service (early-stage foothold)
+Pure SMB logon abuse
+
+Attackers using valid creds stolen from:
+Mimikatz
+LSASS dump
+Token theft
+Browser credential store
+```
+// =======================================================================
+// SMB Brute Force → Successful Lateral Movement – L3 Native Detection
+// Author: Ala Dabat | Platform: MDE / Sentinel
+// Purpose: Detect password spraying or brute force against SMB followed by
+//          successful ADMIN$/C$ access and potential lateral tool staging.
+// MITRE: T1110.003 (Password Spraying), T1021.002 (SMB/Admin Shares),
+//        T1078 (Valid Accounts), T1569.002 (Service Execution)
+// =======================================================================
+
+let lookback = 7d;
+let fail_threshold = 15; // >=15 failures from same IP = brute-force/spray
+let corr_window = 20m;
+
+// -------------------- 1. SMB FAILURE EVENTS --------------------
+let SmbFailures =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 445
+| where ActionType in ("ConnectionFailed","InboundFailed","InboundConnectionFailed")
+| summarize Failures=count() by SourceIP=RemoteIP, bin(Timestamp, 5m)
+| where Failures >= fail_threshold
+| project FailWindowStart = Timestamp, SourceIP, Failures;
+
+// -------------------- 2. SMB SUCCESS EVENTS --------------------
+let SmbSuccess =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 445
+| where ActionType in ("ConnectionSuccess","InboundConnectionAccepted")
+| project SuccessTime = Timestamp, DeviceName, DeviceId,
+          SourceIP = RemoteIP, TargetIP = LocalIP, InitiatingProcessFileName, InitiatingProcessCommandLine;
+
+// -------------------- 3. ADMIN$ / C$ WRITE EVENTS --------------------
+let AdminShareWrites =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FolderPath matches regex @"(?i)^\\\\[A-Za-z0-9_\.-]+\\(ADMIN\$|C\$)"
+| extend TargetHost=tostring(extract(@"\\\\([^\\]+)\\", 1, FolderPath))
+| project WriteTime = Timestamp, TargetHost, FileName, FolderPath, SHA256, DeviceId;
+
+// -------------------- 4. Correlate brute-force → success → file drop --------------------
+SmbFailures
+| join kind=inner (
+    SmbSuccess
+    | project SuccessTime, DeviceName, TargetIP, SourceIP, InitiatingProcessFileName, InitiatingProcessCommandLine
+) on SourceIP
+| where SuccessTime between (FailWindowStart .. FailWindowStart + corr_window)
+| join kind=leftouter (
+    AdminShareWrites
+    | project WriteTime, TargetHost, FileName, FolderPath
+) on $right.TargetHost == $left.TargetIP
+| where isnull(WriteTime) or WriteTime between (SuccessTime .. SuccessTime + corr_window)
+
+// -------------------- 5. Behaviour scoring --------------------
+| extend HasShareWrite = iif(isnotempty(WriteTime), 1, 0)
+| extend HasSuspiciousProc = iif(InitiatingProcessFileName in~ (
+        "powershell.exe","cmd.exe","wmic.exe","sc.exe","rundll32.exe","psexec.exe"
+    ), 1, 0)
+| extend ConfidenceScore =
+    80
+    + iif(Failures >= fail_threshold, 5, 0)         // brute-force detection
+    + iif(HasSuspiciousProc == 1, 5, 0)             // suspicious child
+    + iif(HasShareWrite == 1, 10, 0)                // ADMIN$/C$ write
+    + iif(Failures >= (fail_threshold * 2), 5, 0);  // heavy spraying
+
+// -------------------- 6. Severity classification --------------------
+| extend Severity = case(
+    ConfidenceScore >= 95, "High",
+    ConfidenceScore >= 85, "Medium",
+    "Low"
+)
+
+// -------------------- 7. MITRE context --------------------
+| extend MITRE_Tactics = "TA0006 (Credential Access); TA0008 (Lateral Movement)"
+| extend MITRE_Techniques = strcat(
+    "T1110.003 (Password Spraying), ",
+    "T1021.002 (SMB/ADMIN$), ",
+    iif(HasShareWrite == 1, "T1569.002 (Service Execution), ", ""),
+    "T1078 (Valid Accounts)"
+)
+
+// -------------------- 8. Hunter directives --------------------
+| extend HuntingDirectives = strcat(
+    "Severity=", Severity,
+    "; SourceIP=", SourceIP,
+    "; TargetIP=", TargetIP,
+    "; Failures=", tostring(Failures),
+    "; SuspiciousProc=", tostring(InitiatingProcessFileName),
+    "; ShareWrite=", tostring(HasShareWrite),
+    "; RecommendedNextSteps=",
+    case(
+        Severity == "High",
+            "This pattern indicates brute-force → success → payload staging via SMB. Immediately verify the source IP, check for authorized logons, inspect dropped files on ADMIN$/C$, review NTLM/Kerberos logons, and isolate the device if malicious.",
+        Severity == "Medium",
+            "Review authentication logs for this IP. Validate process legitimacy (cmd/powershell/wmic/sc). Check C$/ADMIN$ for dropped tools and pivot across other SMB connections within ±24h.",
+        "Baseline if this matches expected IT operations; otherwise, treat as a hunting lead and correlate with other lateral movement signals."
+    )
+)
+
+// -------------------- 9. Final projection --------------------
+| project
+    FailWindowStart,
+    SuccessTime,
+    SourceIP,
+    TargetIP,
+    DeviceName,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    FileName,
+    FolderPath,
+    Failures,
+    ConfidenceScore,
+    Severity,
+    MITRE_Tactics,
+    MITRE_Techniques,
+    HuntingDirectives
+| where ConfidenceScore >= 85
+| order by ConfidenceScore desc, SuccessTime desc
+```
+
