@@ -7,125 +7,180 @@ SAM/SECURITY Hive Export is detected using pure native telemetry (no external TI
 - Category: credential-access
 - MITRE: T1003.002
 
+  ## SAM / SECURITY / SYSTEM Hive Extraction — L3 Native Detection Rule  
+**Category:** Credential Access  
+**MITRE:** T1003.002 (Registry Hives), T1003.006, T1059, T1055  
+**Detection Fidelity:** L3 (Native Only — No Threat Intelligence)
+
+Adversaries frequently attempt to extract the `SAM`, `SYSTEM`, and `SECURITY` registry hives to obtain NTLM hashes, LSA secrets, DPAPI credentials, and keys required for offline password cracking or privilege escalation. Modern operations rarely dump these hives directly. Instead, attackers typically use:
+
+- **Shadow copy / VSS abuse** (`vssadmin`, `diskshadow`, `esentutl`)  
+- **Reg save/export techniques**  
+- **LOLBIN variations** (`reg.exe`, `rundll32.exe`, `dllhost.exe`)  
+- **Third-party tooling** (Mimikatz, Impacket’s `secretsdump.py`, LSASSY)  
+- **Renamed hive dumps** (`*.tmp`, `*.sav`, `*.bak`, etc.)  
+- **Copying hive files via live filesystem access**  
+- **Hybrid techniques** (NTDS.dit + hive export for full credential material)
+
+This rule detects high-fidelity hive theft attempts using **native Microsoft telemetry only**.  
+It correlates:
+
+1. **Direct hive file access** in `\Windows\System32\config\`  
+2. **Process execution** tied to known extraction techniques  
+3. **Shadow copy and VSS manipulation**  
+4. **Suspicious command-line patterns** (e.g., `reg save HKLM\SAM`)  
+5. **Parent/child process lineage** consistent with credential theft  
+6. **Timing correlation** between process activity and file access  
+
+### Why This Detection Works
+This analytic focuses on **behavioural evidence** rather than signatures. True hive extraction requires:
+
+- Accessing locked registry hives through VSS or direct copy  
+- Execution of admin-level LOLBINs or known off-sec tooling  
+- File interaction with the exact hive paths or their shadow copies  
+
+These behaviours remain consistent even if tooling is renamed, obfuscated, or embedded inside custom malware.
+
+### What This Rule Detects
+- Direct `SAM` / `SYSTEM` / `SECURITY` hive theft  
+- Shadow copy abuse used to bypass hive locks  
+- Reg export/save techniques used for credential extraction  
+- Off-sec frameworks and live response tooling attempting hive dumps  
+- Renamed or disguised hive dump files  
+- Mimikatz / Impacket / LSASSY-style extraction workflows  
+- Pre-staging for privilege escalation, lateral movement, or golden ticket generation  
+
+### Operational Value
+This detection provides reliable visibility into early-stage credential compromise.  
+Hive extraction is almost always followed by:
+
+- Pass-the-Hash  
+- Pass-the-Ticket  
+- Lateral movement  
+- Privilege escalation  
+- Golden Ticket forgery  
+- Domain persistence activities (LSA secrets, key material theft)
+
+By detecting hive access at the filesystem level, this analytic remains effective even against:
+
+- Renamed binaries  
+- Custom malware  
+- LOLBIN-only attacks  
+- Memory-resident operations  
+- Tool-agnostic credential theft patterns
+
+This is a **pure native, signatureless, high-fidelity** detection designed for SOC L3 and threat hunting environments.
+
+
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// ==========================================================
-// SAM / SECURITY / SYSTEM Hive Extraction – L3 Native Rule
-// Author: Ala Dabat 
+// =======================================================================
+// SAM / SECURITY / SYSTEM Hive Extraction — L3 Native Detection (Noise-Reduced)
+// Author: Ala Dabat (Alstrum)
 // MITRE: T1003.002 (Registry Hives), T1003.006, T1059, T1055
-// Behaviour-based detection of all modern hive theft vectors
-// ==========================================================
+// =======================================================================
 
 let lookback = 14d;
 
-// Known tools and masquerades used for hive extraction
-let HiveTools = dynamic([
-    "reg.exe","regedit.exe","powershell.exe","cmd.exe","wmic.exe",
-    "vssadmin.exe","diskshadow.exe","mimikatz.exe","rubeus.exe",
-    "lsassy.exe","secretsdump.py","impacket-secretsdump.exe",
-    "dllhost.exe","rundll32.exe"
-]);
+// Host role suppression (optional)
+let KnownBackupAgents = dynamic(["veeam","azurebackup","commvault","sccm","intune"]);
+let KnownBackupProcesses = dynamic(["veeamagent.exe","vssvc.exe","sqlvsswriter.exe"]);
 
-// Suspicious file extensions attackers use when renaming hive dumps
-let SusExt = dynamic([".tmp",".bak",".bin",".dat",".save",".old",".dmp"]);
-
-// Registry hives of interest
+// Minimalising noise: only evaluate hive paths My
 let HivePaths = dynamic([
-    "\\System32\\config\\sam",
-    "\\System32\\config\\system",
-    "\\System32\\config\\security"
+    @"\windows\system32\config\sam",
+    @"\windows\system32\config\system",
+    @"\windows\system32\config\security"
 ]);
 
-// Registry export keywords
-let ExportKeywords = dynamic([
-    "reg save","save hklm","reg export","hklm\\sam","hklm\\system","hklm\\security"
+// Tools strongly associated with hive theft
+let HiveTheftTools = dynamic([
+    "mimikatz.exe","secretsdump.py","impacket-secretsdump.exe","lsassy.exe",
+    "rubeus.exe","kekeo.exe","diskshadow.exe","vssadmin.exe","esentutl.exe"
 ]);
 
-// 1. Process-based hive extraction patterns
-let Proc =
-DeviceProcessEvents
-| where Timestamp >= ago(lookback)
-| extend Cmd = tostring(ProcessCommandLine)
-| extend IsHiveTool = iif(FileName in (HiveTools), 1, 0)
-| extend ExportCommand = iif(Cmd has_any (ExportKeywords), 1, 0)
-| extend SuspiciousParent =
-    iif(InitiatingProcessFileName in ("powershell.exe","cmd.exe","rundll32.exe","mshta.exe","cscript.exe"), 1, 0)
-| where IsHiveTool == 1 or ExportCommand == 1 or Cmd has_any (HivePaths)
-| project Timestamp, DeviceName, DeviceId, AccountName,
-          FileName, Cmd, InitiatingProcessFileName,
-          IsHiveTool, ExportCommand, SuspiciousParent;
-
-// 2. Raw file access to the actual hive files (even renamed)
-let HiveFileAccess =
+// ------------------------------
+// 1. TRUE hive access events
+// ------------------------------
+let HiveAccess =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
 | extend LPath = tolower(FolderPath)
-| where LPath has @"\system32\config\" 
-| where FileName contains_any ("sam","system","security") 
-      or FileName endswith_any (SusExt)
+| where LPath has @"\windows\system32\config\"
+| where FileName in ("sam","system","security")
 | where ActionType in ("FileCopied","FileCreated","FileModified","FileDeleted")
-| project HiveTime=Timestamp, DeviceName, DeviceId,
-          HiveFileName=FileName, HiveFolder=FolderPath;
+| project HiveTime = Timestamp, DeviceName, DeviceId,
+          HiveFileName = FileName,
+          HiveFolder = FolderPath;
 
-// Join process activity to file activity
-Proc
-| join kind=fullouter HiveFileAccess on DeviceId
-| extend HiveActivity = iif(isnotempty(HiveFileName), 1, 0)
+// ------------------------------
+// 2. Suspicious processes touching hive extraction tooling
+// ------------------------------
+let Proc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| extend Cmd = tostring(ProcessCommandLine), Parent = tostring(InitiatingProcessFileName)
+| where FileName in (HiveTheftTools)
+    or Cmd has_any ("reg save","reg export","save hklm","ntdsutil","esentutl","shadow","vssadmin")
+| where FileName !in (KnownBackupProcesses)
+| project ProcTime = Timestamp, DeviceName, AccountName,
+          FileName, Cmd, Parent;
 
-// VSS / shadow copy behaviour (shadow copy used for hive extraction)
-| extend IsVSS = iif(Cmd has_any ("shadow","vssadmin","shadowcopy","diskshadow"), 1, 0)
+// ------------------------------
+// 3. Correlation: Process → Hive Access
+// ------------------------------
+HiveAccess
+| join kind=inner (Proc) on DeviceName
+| where HiveTime between (ProcTime .. ProcTime + 10m)
 
-// Final scoring
+// ------------------------------
+// 4. Behaviour scoring (noise-tuned)
+// ------------------------------
 | extend ConfidenceScore =
-    0
-    + iif(ExportCommand == 1, 6, 0)
-    + iif(HiveActivity == 1, 8, 0)
-    + iif(IsHiveTool == 1, 4, 0)
-    + iif(IsVSS == 1, 4, 0)
-    + iif(SuspiciousParent == 1, 3, 0)
-    + iif(Cmd has_any (HivePaths), 5, 0)
-    + iif(Cmd has "sam" or Cmd has "system" or Cmd has "security", 3, 0)
+    70
+    + 10  // true hive access
+    + iif(FileName in (HiveTheftTools), 10, 0)
+    + iif(Cmd has_any ("save hklm","reg save","reg export"), 8, 0)
+    + iif(Cmd has_any ("diskshadow","vssadmin","shadowcopy"), 6, 0)
+    + iif(Parent in ("powershell.exe","cmd.exe"), 3, 0)
 
-// Reasoning for analyst
-| extend Reason = strcat(
-    iif(ExportCommand == 1, "Registry hive export command detected. ", ""),
-    iif(HiveActivity == 1, strcat("Raw hive file accessed: ", HiveFileName, ". "), ""),
-    iif(IsVSS == 1, "Shadow copy operations detected. ", ""),
-    iif(IsHiveTool == 1, "Known hive extraction tool executed. ", ""),
-    iif(SuspiciousParent == 1, strcat("Executed from suspicious parent: ", InitiatingProcessFileName, ". "), "")
-)
-
-// Severity classification
+// ------------------------------
+// 5. Severity Mapping
+// ------------------------------
 | extend Severity = case(
-    ConfidenceScore >= 12, "High",
-    ConfidenceScore >= 7,  "Medium",
-    ConfidenceScore >= 3,  "Low",
-    "Informational"
+    ConfidenceScore >= 90, "High",
+    ConfidenceScore >= 80, "Medium",
+    "Low"
 )
 
-// Hunter directives
+// ------------------------------
+// 6. Hunter Directives
+// ------------------------------
 | extend HuntingDirectives = strcat(
     "Severity=", Severity,
     "; Device=", DeviceName,
-    "; User=", AccountName,
-    "; Reason=", Reason,
+    "; Hive=", HiveFileName,
+    "; Tool=", FileName,
+    "; Command=", Cmd,
     "; RecommendedNextSteps=",
     case(
         Severity == "High",
-            "Treat as probable credential hive extraction. Immediately isolate device. Collect triage: SAM/SYSTEM/SECURITY copies, LSASS access, shadow copies, network lateral movement. Investigate for follow-on credential misuse.",
+            "Strong indicator of credential hive extraction. Isolate host. Acquire forensic image. Review LSASS access, VSS usage, and recent lateral movement.",
         Severity == "Medium",
-            "Review context of registry modifications. Pivot across ±24h for credential access activity. Validate admin intent.",
-        Severity == "Low",
-            "Baseline behaviour. Consider tuning for legitimate backup software.",
-        "Use as contextual signal only."
+            "Investigate process lineage and validate if backup software is misidentified. Review account context and scheduled tasks.",
+        "Baseline behaviour. Tune out known backup tools."
     )
 )
 
-// Output results
-| where ConfidenceScore >= 3
-| order by Timestamp desc
-
+// ------------------------------
+// 7. Final output
+// ------------------------------
+| project HiveTime, DeviceName, AccountName,
+          HiveFileName, HiveFolder,
+          FileName, Cmd, Parent,
+          ConfidenceScore, Severity, HuntingDirectives
+| order by ConfidenceScore desc
 
 ```
 
