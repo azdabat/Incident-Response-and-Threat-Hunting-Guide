@@ -10,68 +10,127 @@ High-Entropy Payload Drops (Polymorphic) is detected using pure native telemetry
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-let starttime = 14d;
-let endtime = 1d;
-// Baseline: Calculate common remote ports for each device over a learning period
-let BaselineData = 
-    DeviceNetworkEvents
-    | where Timestamp between (ago(starttime) .. ago(endtime))
-    | where isnotempty(RemotePort) and isnotempty(DeviceName)
-    | summarize BaselinePortCount = dcount(RemotePort) by DeviceName;
-// Look for anomalous connections in the last day
-let RecentNetworkEvents = 
-    DeviceNetworkEvents
-    | where Timestamp > ago(endtime)
-    | where ActionType == "ConnectionSuccess"
-    // Join with baseline to find devices with low port diversity, potentially indicative of C2
-    | join kind=inner BaselineData on DeviceName
-    | where BaselinePortCount < 10 // Tune this threshold for your environment
-    // Enrich with process information and identity data
-    | join kind=inner (
-        DeviceProcessEvents
-        | where Timestamp > ago(endtime)
-        | project DeviceId, InitiatingProcessParentFileName, InitiatingProcessFileName, InitiatingProcessCommandLine, ProcessId
-    ) on DeviceId
-    | join kind=leftouter (
-        IdentityInfo
-        | where isnotempty(AccountUpn)
-        | summarize arg_max(TimeGenerated, *) by AccountUpn // Get the latest identity record for a user
-        | project AccountUpn, AccountDisplayName, Department, IsAccountEnabled
-    ) on $left.AccountName == $right.AccountUpn;
-// Analyze the enriched data for specific C2 indicators
-RecentNetworkEvents
-| extend Protocol = case(
-    RemotePort in~ (53, 5353) or Protocol contains "dns", "DNS",
-    RemotePort in~ (80, 443, 8080, 8443) or Protocol contains "http", "HTTP",
-    "Other"
-)
-| extend SuspiciousProcess = case(
-        InitiatingProcessFileName in~ ("nslookup.exe", "powershell.exe", "certutil.exe", "mshta.exe") 
-        and InitiatingProcessParentFileName != "cmd.exe", 1, 0 // Example: Tune parent-child logic
-    )
-| extend SuspiciousDomain = iff(RemoteUrl has_any(".ddns.net", ".duckdns.org", ".servebeer.com") or RemoteUrl contains "-", 1, 0) // Example suspicious TLDs/patterns[citation:2]
-| extend LongLivedSignal = iff(BaselinePortCount < 5 and Protocol == "DNS", 1, 0) // Specific signal for low-port-count, long-lived DNS C2
-// Calculate a dynamic confidence score
-| extend ConfidenceScore = case(
-    LongLivedSignal == 1 and SuspiciousDomain == 1, 8, // High confidence
-    LongLivedSignal == 1 and SuspiciousProcess == 1, 7, // Medium-High confidence
-    LongLivedSignal == 1, 5, // Medium confidence
-    Protocol == "DNS" and SuspiciousProcess == 1, 4, // Low-Medium confidence
-    1 // Informational - all other connections for context
-)
-// Filter to interesting events and project final output
-| where ConfidenceScore >= 3
+// ======================================================
+// High-Entropy / Polymorphic Payload Drops – L3 Detection
+// Category: defense-evasion / execution
+// MITRE: T1027 (Obfuscated/Encrypted), T1204, T1059
+// Author: Ala Dabat (Alstrum)
+// ======================================================
+
+let lookback = 14d;
+
+// Staging locations attackers love
+let StagingFolders = dynamic([
+    @"C:\Users\",
+    @"C:\ProgramData\",
+    @"C:\Windows\Temp\",
+    @"C:\Temp\",
+    @"C:\Users\Public\",
+    @"C:\Windows\Tasks\"
+]);
+
+// Suspicious payload extensions (tune for environment)
+let SuspiciousExt = dynamic([
+    ".exe",".dll",".sys",".bin",".dat",".tmp",".scr",
+    ".ps1",".vbs",".js",".jse",".cmd",".bat"
+]);
+
+// Keywords hinting at crypto/encoding/unpacking
+let CryptoKeywords = dynamic([
+    "FromBase64String","Base64String","-enc","-EncodedCommand",
+    "decrypt","decryption","unpack","xor","rc4","aes","shellcode",
+    "VirtualAlloc","VirtualProtect","WriteProcessMemory","CreateThread"
+]);
+
+// 1. File drops in staging locations that look like payloads
+let StagedPayloads =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed")
+| extend LPath = tolower(FolderPath), LName = tolower(FileName)
+| where LPath startswith_any (StagingFolders)
+| extend Ext = tostring(extract(@"\.(\w+)$", 1, LName))
+| extend ExtFull = strcat(".", Ext)
+| where ExtFull in (SuspiciousExt)
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          FolderPath, FileName, SHA1, SHA256, FileSize, InitiatingProcessFileName,
+          InitiatingProcessCommandLine;
+
+// 2. Try to derive basic "entropy" heuristics without true entropy column
+//    - long, random-looking file names
+//    - large binaries in odd places
+let EnrichedPayloads =
+StagedPayloads
+| extend NameLength = strlen(FileName)
+| extend IsLongName = iif(NameLength >= 20, 1, 0)
+| extend IsBigFile = iif(FileSize >= 500000, 1, 0)  // > ~500KB
+| extend HasNoHash = iif(isempty(SHA1) and isempty(SHA256), 1, 0);
+
+// 3. Correlate with process command lines for signs of decoding/unpacking
+let ProcContext =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where ProcessCommandLine has_any (CryptoKeywords)
+| project ProcTime = Timestamp, DeviceId, DeviceName, AccountName,
+          ProcName = FileName, ProcCmd = ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine;
+
+// Join file drops to suspicious process context on same device and user
+EnrichedPayloads
+| join kind=leftouter ProcContext on DeviceId, AccountName
+| extend HasCryptoContext = iif(isnotempty(ProcName), 1, 0)
+
+// 4. Behaviour-based scoring (pseudo-entropy via multiple weak indicators)
+| extend ConfidenceScore =
+    0
+    + iif(IsBigFile == 1,                           3, 0)   // large binary payload
+    + iif(IsLongName == 1,                          2, 0)   // random-looking name
+    + iif(HasCryptoContext == 1,                    4, 0)   // unpack/crypto tooling nearby
+    + iif(ExtFull in (dynamic([".dll",".sys",".bin",".dat",".tmp"])), 3, 0)
+    + iif(ExtFull in (dynamic([".ps1",".js",".jse",".vbs"])),          2, 0)
+    + iif(HasNoHash == 1,                           1, 0)   // some older schemas or odd telemetry
+
+// 5. Analyst-facing explanation
 | extend Reason = strcat(
-    "Long-lived external session potential C2. Protocol: ", Protocol, 
-    ". BaselinePortCount: ", BaselinePortCount,
-    ". SuspiciousProcess: ", tostring(SuspiciousProcess),
-    ". SuspiciousDomain: ", tostring(SuspiciousDomain)
+    "Payload dropped in staging path: ", FolderPath, "\\", FileName, ". ",
+    iif(IsBigFile == 1, "Large binary in non-standard location. ", ""),
+    iif(IsLongName == 1, "File name appears long/random. ", ""),
+    iif(HasCryptoContext == 1, strcat("Nearby process using crypto/encode keywords: ", ProcName, ". "), ""),
+    iif(ExtFull in (dynamic([".dll",".sys",".bin",".dat",".tmp"])), "Binary-like extension. ", ""),
+    iif(ExtFull in (dynamic([".ps1",".js",".jse",".vbs"])), "Script extension commonly used as loader. ", "")
 )
-| extend Severity = case(ConfidenceScore >= 8, "High", ConfidenceScore >= 5, "Medium", ConfidenceScore >= 3, "Low", "Informational")
-| project Timestamp, DeviceName, AccountName, AccountDisplayName, IsAccountEnabled, 
-    RemoteIP, RemoteUrl, RemotePort, Protocol, InitiatingProcessFileName, InitiatingProcessCommandLine,
-    ConfidenceScore, Severity, Reason, BaselinePortCount
-| order by ConfidenceScore desc, Timestamp desc
+
+// 6. Severity mapping
+| extend Severity = case(
+    ConfidenceScore >= 10, "High",
+    ConfidenceScore >= 6,  "Medium",
+    ConfidenceScore >= 3,  "Low",
+    "Informational"
+)
+
+// 7. Hunter directives
+| extend HuntingDirectives = strcat(
+    "Severity=", Severity,
+    "; Device=", DeviceName,
+    "; User=", AccountName,
+    "; Path=", FolderPath, "\\", FileName,
+    "; Reason=", Reason,
+    "; RecommendedNextSteps=",
+    case(
+        Severity == "High",
+            "Treat as likely packed or encrypted payload. Examine InitiatingProcessCommandLine for decoding/unpacking logic. Check for follow-on execution from this path, memory injection, or abnormal network traffic. Isolate host if other malicious indicators exist.",
+        Severity == "Medium",
+            "Manually inspect the file (static + detonation in controlled environment). Correlate with process tree. Review whether this is part of legitimate software deployment or a suspicious drop.",
+        Severity == "Low",
+            "Baseline behaviour for this endpoint. Consider adding known-good software drop patterns to exclusions.",
+        "Use as contextual indicator. Combine with other detections."
+    )
+)
+
+// 8. Final filter
+| where ConfidenceScore >= 3
+| order by Timestamp desc
+
 ```
 
 The query exposes:
