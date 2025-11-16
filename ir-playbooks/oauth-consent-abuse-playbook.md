@@ -48,3 +48,4 @@
   - Internal playbooks and SOPs
   - Threat models and risk register entries
   - Knowledge base entries so future analysts can recognise this pattern quickly.
+  - FIDO Keys should be used for all company devices. 
