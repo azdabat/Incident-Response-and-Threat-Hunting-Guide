@@ -10,38 +10,93 @@ File Timestomping Behaviour is detected using pure native telemetry (no external
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-let lookback = 14d;
-DeviceProcessEvents
-| where Timestamp >= ago(lookback)
-| extend Cmd = tostring(ProcessCommandLine)
-| extend ConfidenceScore = 4
-| extend Reason = "timestomping – baseline native behavioural detection; tune conditions to match your environment."
-| project Timestamp, DeviceId, DeviceName, AccountName,
-          FileName, Cmd,
-          InitiatingProcessFileName, InitiatingProcessCommandLine,
-          ConfidenceScore, Reason
+// =====================================================================
+//  File Timestomping Detection (MDE / Sentinel)
+//  MITRE: T1070.006 — Timestamp Manipulation
+//  Author: Ala Dabat (Alstrum) — 2025 Native Evasion Pack
+// =====================================================================
 
+let lookback = 14d;
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+
+// Only files where MDE captured *previous* timestamps
+| where isnotempty(PreviousFileCreationTime) 
+   or isnotempty(PreviousFileModificationTime)
+
+// -----------------------------------------------------------
+//  Detect timestamp **rollback** (backdating)
+// -----------------------------------------------------------
+| extend CreationRollback = 
+    (datetime_diff("minute", FileCreationTime, PreviousFileCreationTime) < -10)
+
+| extend ModificationRollback =
+    (datetime_diff("minute", FileModificationTime, PreviousFileModificationTime) < -10)
+
+// -----------------------------------------------------------
+//  Detect abnormal timestamp deltas (jump forward/backwards strongly)
+// -----------------------------------------------------------
+| extend CreationDelta = abs(datetime_diff("hour", FileCreationTime, Timestamp))
+| extend ModificationDelta = abs(datetime_diff("hour", FileModificationTime, Timestamp))
+
+| extend SuspiciousDelta = CreationDelta > 168 or ModificationDelta > 168  // > 7 days difference
+
+// -----------------------------------------------------------
+//  Score the behaviour
+// -----------------------------------------------------------
+| extend BehaviourScore =
+      (iif(CreationRollback, 4, 0))
+    + (iif(ModificationRollback, 4, 0))
+    + (iif(SuspiciousDelta, 2, 0))
+
+| where BehaviourScore >= 3   // ignore noise
+
+| extend ConfidenceScore = BehaviourScore
 | extend Severity = case(
     ConfidenceScore >= 8, "High",
     ConfidenceScore >= 5, "Medium",
     ConfidenceScore >= 3, "Low",
     "Informational"
 )
+
+// -----------------------------------------------------------
+//  Hunting Directives (L3 Triage Guidance)
+// -----------------------------------------------------------
 | extend HuntingDirectives = strcat(
+    "[TimestompingDetection] ",
     "Severity=", Severity,
-    "; Device=", tostring(DeviceName),
-    "; User=", tostring(AccountName),
-    "; CoreReason=", Reason,
-    "; RecommendedNextSteps=",
+    "; Device=", DeviceName,
+    "; User=", AccountName,
+    "; Indicators=",
+        case(CreationRollback, "CreationRollback;", ""),
+        case(ModificationRollback, "ModificationRollback;", ""),
+        case(SuspiciousDelta, "LargeDelta;", ""),
+    " | NextSteps=",
     case(
-        Severity == "High", "Isolate host, collect full triage (process, file, network, identity), check for lateral movement and credential theft, notify IR lead.",
-        Severity == "Medium", "Validate admin/change context, pivot ±24h on the same device/user, correlate with other detections, decide on containment.",
-        Severity == "Low", "Baseline this behaviour for this asset/user, treat as a weak hunting signal, consider tuning or elevating if seen with other anomalies.",
-        "Use as contextual signal only; combine with higher-confidence rules."
+        Severity == "High",
+        "Isolate host, triage for anti-forensics activity, inspect recent process creations, correlate with malware staging, investigate attacker cleanup operations.",
+
+        Severity == "Medium",
+        "Validate legitimate installer/patch operations, pivot by hash and filename, check for related file writes or deletes.",
+
+        Severity == "Low",
+        "Rare benign scenario (installer rollbacks). Baseline or tune if recurring.",
+
+        "Correlation-only signal."
     )
 )
-| where ConfidenceScore >= 3
+
+// -----------------------------------------------------------
+//  Output
+// -----------------------------------------------------------
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          FileName, FolderPath,
+          FileCreationTime, PreviousFileCreationTime,
+          FileModificationTime, PreviousFileModificationTime,
+          CreationRollback, ModificationRollback, SuspiciousDelta,
+          ConfidenceScore, Severity, HuntingDirectives
 | order by Timestamp desc
+
 ```
 
 The query exposes:
