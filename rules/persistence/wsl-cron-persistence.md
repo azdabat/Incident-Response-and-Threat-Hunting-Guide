@@ -10,38 +10,159 @@ WSL Cron-based Persistence is detected using pure native telemetry (no external 
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
+// =====================================================================
+// WSL Cron / WSL-Based Persistence Detection (L3 – Low Noise)
+// Author: Ala Dabat (Alstrum)
+// Focus: WSL launched with persistence-oriented arguments, suspicious parents,
+//        network loaders, encoded payloads, or user-writable cron/script paths.
+// MITRE: T1611 (Escape to Host), T1053 (Scheduled Task/Cron), T1059.003 (Unix Shell)
+// =====================================================================
+
 let lookback = 14d;
+
+// // WSL binaries
+let WSLBins = dynamic(["wsl.exe","wslhost.exe","bash.exe","ubuntu.exe","kali.exe","debian.exe"]);
+
+// // High-risk parents (macro → WSL, lolbin → WSL, browser → WSL)
+let SuspiciousParents = dynamic([
+    "mshta.exe","wscript.exe","cscript.exe",
+    "powershell.exe","pwsh.exe",
+    "regsvr32.exe","rundll32.exe",
+    "chrome.exe","msedge.exe","firefox.exe"
+]);
+
+// // Indicators of persistence or host interaction
+let PersistenceIndicators = dynamic([
+    "crontab","/etc/cron.","/etc/cron.d","/etc/cron.daily",
+    "/etc/rc.local","systemctl","service ",
+    "/etc/init.d"
+]);
+
+// // Sensitive paths attackers may touch
+let SensitiveWSLPaths = dynamic([
+    "/etc/shadow","/etc/passwd","/etc/sudoers","/root/.ssh",
+    "/var/spool/cron","/var/run/docker.sock"
+]);
+
+// // User-writable or staging paths
+let UserWritableRx = @"(?i)^/mnt/c/(users|public|programdata|temp|appdata)/";
+
+// // Encoded, download, or loader behaviours
+let LoaderStrings = dynamic([
+    "-encodedcommand"," -enc ","frombase64string","curl ","wget ",
+    "invoke-webrequest","downloadstring","python -c","perl -e"
+]);
+
+// // Regex patterns
+let NetworkExecRx = @"\b(nc|netcat|curl|wget|python\s+-c|perl\s+-e)\b";
+let CronEditRx = @"(?i)(crontab|-l| -e|/etc/cron\.)";
+let MountRx = @"(?i)(--mount|--unmount).*(/mnt/c/Windows|/mnt/c/Users|/mnt/c/ProgramData)";
+
+// =====================================================================
+// Raw WSL activity
+// =====================================================================
+let RawWSL =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| extend Cmd = tostring(ProcessCommandLine)
-| extend ConfidenceScore = 4
-| extend Reason = "wsl-cron-persistence – baseline native behavioural detection; tune conditions to match your environment."
-| project Timestamp, DeviceId, DeviceName, AccountName,
-          FileName, Cmd,
-          InitiatingProcessFileName, InitiatingProcessCommandLine,
-          ConfidenceScore, Reason
+| where FileName in~ (WSLBins)
+| extend CL = tolower(ProcessCommandLine),
+         Parent = tolower(InitiatingProcessFileName);
 
+// =====================================================================
+// Signal extraction
+// =====================================================================
+let WithSignals =
+RawWSL
+| extend
+    TouchesSensitive = CL has_any (SensitiveWSLPaths),
+    HasCronBehaviour = CL matches regex CronEditRx or CL has_any (PersistenceIndicators),
+    HasNetworkExec = CL matches regex NetworkExecRx,
+    HasLoaderString = CL has_any (LoaderStrings),
+    SuspiciousParent = Parent in~ (SuspiciousParents),
+    MountAbuse = CL matches regex MountRx,
+    UserWritableRef = CL matches regex UserWritableRx;
+
+// =====================================================================
+// Rarity & signer trust
+// =====================================================================
+let Prevalence =
+DeviceFileEvents
+| where Timestamp >= ago(30d)
+| summarize DeviceCount=dcount(DeviceId) by SHA256;
+
+let Enriched =
+WithSignals
+| join kind=leftouter (Prevalence) on $left.InitiatingProcessSHA256 == $right.SHA256
+| extend DeviceCount = coalesce(DeviceCount,0),
+         IsRare = iif(DeviceCount <= 2, 1, 0),
+         TrustedSigner = iif(
+            InitiatingProcessSigner in~ (
+                "Microsoft Windows","Microsoft Windows Publisher",
+                "Microsoft Corporation","Canonical","Debian Project"
+            ), 1, 0);
+
+// =====================================================================
+// Behaviour-based scoring (L3 threshold)
+// =====================================================================
+Enriched
+| extend SignalCount =
+      toint(HasCronBehaviour)
+    + toint(MountAbuse)
+    + toint(HasNetworkExec)
+    + toint(TouchesSensitive)
+    + toint(HasLoaderString)
+    + toint(UserWritableRef)
+    + toint(SuspiciousParent)
+    + toint(IsRare)
+    + toint(1 - TrustedSigner)
+| where SignalCount >= 3   // low noise
+
+// =====================================================================
+// Severity
+// =====================================================================
 | extend Severity = case(
-    ConfidenceScore >= 8, "High",
-    ConfidenceScore >= 5, "Medium",
-    ConfidenceScore >= 3, "Low",
-    "Informational"
+    SignalCount >= 7, "High",
+    SignalCount >= 5, "Medium",
+    "Low"
 )
+
+// =====================================================================
+// Hunting directives (concise, non-AI style)
+// =====================================================================
 | extend HuntingDirectives = strcat(
     "Severity=", Severity,
-    "; Device=", tostring(DeviceName),
-    "; User=", tostring(AccountName),
-    "; CoreReason=", Reason,
-    "; RecommendedNextSteps=",
+    "; Device=", DeviceName,
+    "; User=", AccountName,
+    "; Parent=", InitiatingProcessFileName,
+    "; Indicators=",
+        iif(HasCronBehaviour,"Cron;",""),
+        iif(HasNetworkExec,"NetExec;",""),
+        iif(TouchesSensitive,"SensitiveFile;",""),
+        iif(MountAbuse,"MountAbuse;",""),
+        iif(HasLoaderString,"Loader;",""),
+        iif(UserWritableRef,"UserWritable;",""),
+        iif(SuspiciousParent,"SuspParent;",""),
+        iif(IsRare,"RareBinary;",""),
+    "; Next=",
     case(
-        Severity == "High", "Isolate host, collect full triage (process, file, network, identity), check for lateral movement and credential theft, notify IR lead.",
-        Severity == "Medium", "Validate admin/change context, pivot ±24h on the same device/user, correlate with other detections, decide on containment.",
-        Severity == "Low", "Baseline this behaviour for this asset/user, treat as a weak hunting signal, consider tuning or elevating if seen with other anomalies.",
-        "Use as contextual signal only; combine with higher-confidence rules."
+        Severity == "High",  "Check for persistence (cron/systemd). Inspect mount targets and host file access. Review outbound network traffic. Consider host isolate.",
+        Severity == "Medium","Review command line and parent chain. Verify user intent. Pivot ±24h across WSL, network, and file activity.",
+        "Baseline unusual-but-benign usage; keep as a hunting cue."
     )
 )
-| where ConfidenceScore >= 3
-| order by Timestamp desc
+
+// =====================================================================
+// Output
+// =====================================================================
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          HasCronBehaviour, TouchesSensitive, HasNetworkExec,
+          HasLoaderString, UserWritableRef, SuspiciousParent,
+          MountAbuse, IsRare, TrustedSigner,
+          SignalCount, Severity, HuntingDirectives
+| order by SignalCount desc, Timestamp desc
+
 ```
 
 The query exposes:
