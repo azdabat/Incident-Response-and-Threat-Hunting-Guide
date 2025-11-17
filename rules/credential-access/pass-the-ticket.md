@@ -58,204 +58,124 @@ It helps identify advanced tradecraft where attackers bypass passwords entirely,
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// =====================================================
-// Pass-the-Ticket (PTT) – Native L3 Detection (Noise-Reduced)
-// Author: Ala Dabat (Alstrum)
-// MITRE: T1550.003 (Pass-the-Ticket), T1558.003 (Kerberos Tickets)
-// Behavioural focus: Kerberos ticket replay / forging
-// =====================================================
+// Pass-the-Ticket (PTT) — Native L3 Detection
+// MITRE: T1550.003, T1558.003
+// Author: Ala Dabat | 2025-11
 
 let lookback = 14d;
-let min_events = 5;
-let min_unique_spns = 3;
 
-// Optional: known DCs / KDCs or Kerberos infra hosts (tune for your env)
-let DomainControllers = dynamic([
-    // "dc01.contoso.local",
-    // "dc02.contoso.local"
-]);
-
-// Common PTT / Kerberos tooling (extend as needed)
+let DomainControllers = dynamic([]);
 let PTTTools = dynamic([
-    "rubeus.exe", "mimikatz.exe", "kekeo.exe",
-    "ticket.exe", "invoke-mimikatz.ps1", "sekurlsa.dll"
+    "rubeus.exe","mimikatz.exe","kekeo.exe",
+    "ticket.exe","invoke-mimikatz.ps1","sekurlsa.dll"
 ]);
 
-// Sensitive SPNs attackers often target to elevate or move laterally
 let SensitiveSPNs = dynamic([
-    "cifs/", "host/", "ldap/", "mssqlsvc/",
-    "krbtgt", "http/", "wsman/", "termsrv/"
+    "cifs/","host/","ldap/","mssqlsvc/","http/","termsrv/","wsman/","krbtgt"
 ]);
 
-// High-value account patterns (tune to your naming conventions)
 let HighValueAccounts = dynamic([
-    "admin", "administrator", "adm", "da",
-    "tier0", "svc", "service", "backup", "sql"
+    "admin","administrator","adm","da","tier0","svc","service","backup","sql"
 ]);
 
-// =====================================================
-// 1. Kerberos activity (IdentityLogonEvents)
-// =====================================================
+// 1 — Kerberos activity (successful)
 let Kerb =
 IdentityLogonEvents
 | where Timestamp >= ago(lookback)
 | where Protocol has "Kerberos"
 | where Result == "Success"
 | where isnotempty(ServicePrincipalName)
-| where isnotempty(AccountUpn)
-| where AccountName !endswith "$"    // filter machine accounts
-| extend
-    SPN  = tostring(ServicePrincipalName),
-    UPN  = tostring(AccountUpn),
-    Host = tostring(DeviceName),
-    TargetHost = tostring(TargetDeviceName),
-    EncType = tostring(EncryptionType)
-| where Host !in (DomainControllers) // focus away from DCs/KDCs
-| project Timestamp, UPN, Host, TargetHost, SPN, EncType;
+| where AccountName !endswith "$"
+| extend SPN=tostring(ServicePrincipalName),
+         Host=tostring(DeviceName),
+         TargetHost=tostring(TargetDeviceName),
+         UPN=tostring(AccountUpn),
+         EncType=tostring(EncryptionType)
+| where Host !in (DomainControllers)
+| project Timestamp, Host, TargetHost, UPN, SPN, EncType;
 
-// =====================================================
-// 2. Behaviour flags on individual events
-// =====================================================
+// 2 — Behavioural flags
 let KerbEval =
 Kerb
-| extend IsSensitiveSPN =
-    iif(SPN has_any (SensitiveSPNs), 1, 0)
-| extend IsHighValueAccount =
-    iif(UPN has_any (HighValueAccounts), 1, 0)
-| extend IsWeakEnc =
-    iif(EncType in ("rc4","rc4-hmac","des","des-cbc-crc"), 1, 0)
-| extend IsCrossHost =
-    iif(isnotempty(TargetHost) and Host != TargetHost, 1, 0);
+| extend SensitiveSPN   = SPN has_any (SensitiveSPNs),
+         HighValueAcct  = UPN has_any (HighValueAccounts),
+         WeakEncryption = EncType in ("rc4","rc4-hmac","des","des-cbc-crc"),
+         CrossHost      = isnotempty(TargetHost) and Host != TargetHost;
 
-// =====================================================
-// 3. Aggregate per account + host (behaviour clustering)
-// =====================================================
+// 3 — Aggregate Kerberos behaviour by account + host
 let KerbAgg =
 KerbEval
 | summarize
-    FirstSeen        = min(Timestamp),
-    LastSeen         = max(Timestamp),
-    Events           = count(),
-    UniqueSPNs       = dcount(SPN),
-    SPNSample        = take_any(SPN),
-    SPNList          = make_set(SPN, 20),
-    AnySensitiveSPN  = max(IsSensitiveSPN),
-    AnyWeakEnc       = max(IsWeakEnc),
-    AnyCrossHost     = max(IsCrossHost),
-    IsHighValue      = max(IsHighValueAccount)
-  by UPN, Host
-| extend DurationMinutes = datetime_diff("minute", LastSeen, FirstSeen)
-| where Events >= min_events
-| where UniqueSPNs >= min_unique_spns;
+      FirstSeen=min(Timestamp),
+      LastSeen=max(Timestamp),
+      Events=count(),
+      UniqueSPNs=dcount(SPN),
+      SPNSample=take_any(SPN),
+      SPNList=make_set(SPN,20),
+      AnySensitiveSPN=max(SensitiveSPN),
+      AnyWeakEnc=max(WeakEncryption),
+      AnyCrossHost=max(CrossHost),
+      IsHighValue=max(HighValueAcct)
+  by Host, UPN
+| extend DurationMinutes=datetime_diff("minute",LastSeen,FirstSeen)
+| where Events >= 5 and UniqueSPNs >= 3;
 
-// =====================================================
-// 4. Process evidence (tooling correlation on the host)
-// =====================================================
-let ProcEvidence =
+// 4 — Tooling evidence on host
+let ToolHits =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName in (PTTTools)
-   or ProcessCommandLine has_any ("ptt","kirbi","asktgt","asktgs","/ptt")
-| summarize
-    HasTooling = 1,
-    ToolSample = take_any(FileName),
-    ToolCmd    = take_any(ProcessCommandLine),
-    ToolFirstSeen = min(Timestamp),
-    ToolLastSeen  = max(Timestamp)
+   or ProcessCommandLine has_any ("kirbi","asktgt","asktgs","/ptt")
+| summarize HasTooling=1,
+            ToolSample=take_any(FileName),
+            ToolCmd=take_any(ProcessCommandLine)
   by DeviceName;
 
+// Join Kerberos behaviour and tooling
 KerbAgg
-| join kind=leftouter (ProcEvidence) on $left.Host == $right.DeviceName
-| extend HasTooling = iif(isnotempty(HasTooling), 1, 0)
+| join kind=leftouter (ToolHits) on $left.Host == $right.DeviceName
+| extend HasTooling=iif(isnotempty(HasTooling),1,0)
 
-// =====================================================
-// 5. Behaviour-based confidence scoring (noise-aware)
-// =====================================================
-| extend BaseScore = 70
-| extend ConfidenceScore =
-    BaseScore
-    // Strong signals: tooling + high-value account + sensitive SPNs
-    + iif(HasTooling == 1 and IsHighValue == 1,           10, 0)
-    + iif(HasTooling == 1 and AnySensitiveSPN == 1,       8, 0)
-    // High-value accounts touching sensitive SPNs
-    + iif(IsHighValue == 1 and AnySensitiveSPN == 1,      6, 0)
-    // Weak/legacy encryption for high-value accounts
-    + iif(AnyWeakEnc == 1 and IsHighValue == 1,           4, 0)
-    // Cross-host usage suggests lateral tickets, not local
-    + iif(AnyCrossHost == 1 and IsHighValue == 1,         4, 0)
-    // High SPN fan-out for a single account (sweep / replay)
-    + iif(UniqueSPNs >= 10,                               4, 0)
-    + iif(UniqueSPNs between (6 .. 9),                    2, 0);
-
-// Reason text
-| extend Reason = strcat(
-    iif(HasTooling == 1,
-        strcat("PTT/kerberos tooling observed on host (e.g. ", ToolSample, "). "), ""),
-    iif(IsHighValue == 1,
-        "High-value account involved. ", ""),
-    iif(AnySensitiveSPN == 1,
-        "Kerberos activity against sensitive SPNs (cifs/host/ldap/sql/http/termsrv). ", ""),
-    iif(AnyWeakEnc == 1,
-        "Weak/legacy Kerberos encryption (RC4/DES) used by high-value account. ", ""),
-    iif(AnyCrossHost == 1,
-        "Account using Kerberos tickets across multiple hosts (possible replay). ", ""),
-    iif(UniqueSPNs >= 10,
-        strcat("High SPN fan-out from single account (", tostring(UniqueSPNs), " SPNs). "), "")
-)
-
-// =====================================================
-// 6. Severity & hunter directives
-// =====================================================
+// 5 — Severity (simple, behaviour-based — no weighted scoring)
 | extend Severity = case(
-    ConfidenceScore >= 95, "High",
-    ConfidenceScore >= 85, "Medium",
-    ConfidenceScore >= 80, "Low",
-    "Informational"
-)
-| extend MITRE_Tactics    = "TA0006 (Credential Access); TA0008 (Lateral Movement)",
-         MITRE_Techniques = "T1550.003 (Pass-the-Ticket), T1558.003 (Kerberos Tickets)";
-
-| extend ThreatHunterDirectives = strcat(
-    "Severity=", Severity,
-    "; Host=", Host,
-    "; Account=", UPN,
-    "; UniqueSPNs=", tostring(UniqueSPNs),
-    "; SPNSample=", SPNSample,
-    "; HasTooling=", tostring(HasTooling),
-    "; Reason=", Reason,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High",
-            "Treat as probable Pass-the-Ticket or forged ticket usage. Validate whether the observed tickets and SPNs are legitimate for this account and host. Hunt for Rubeus/Mimikatz artefacts, LSASS access, and potential KRBTGT compromise. Isolate the host and rotate affected credentials if compromise is confirmed.",
-        Severity == "Medium",
-            "Confirm whether this behaviour aligns with expected service or admin activity. Investigate process history on the host, check for Kerberos-related tooling, and pivot to correlated Kerberos, LSASS, and lateral movement events in the same timeframe.",
-        Severity == "Low",
-            "Review as potential baseline for the account/service. If benign, consider documenting as known-good behaviour; otherwise, monitor for escalation in score or additional corroborating detections.",
-        "Use as a contextual hunting signal. Combine with other credential-access and lateral-movement detections before escalation."
-    )
+      HasTooling == 1 and AnySensitiveSPN == 1 and IsHighValue == 1, "High",
+      HasTooling == 1 and AnySensitiveSPN == 1,                      "High",
+      AnyCrossHost == 1 and AnySensitiveSPN == 1,                    "High",
+      AnySensitiveSPN == 1 and IsHighValue == 1,                     "Medium",
+      AnyWeakEnc == 1 and IsHighValue == 1,                          "Medium",
+      HasTooling == 1,                                               "Medium",
+      AnySensitiveSPN == 1 or AnyCrossHost == 1,                     "Low",
+      "Informational"
 )
 
-// =====================================================
-// 7. Final filter and projection
-// =====================================================
-| where ConfidenceScore >= 85   // Medium+ by default; tune for hunting vs alerting
-| project
-    FirstSeen,
-    LastSeen,
-    DurationMinutes,
-    Host,
-    UPN,
-    UniqueSPNs,
-    SPNSample,
-    HasTooling,
-    ToolSample,
-    ConfidenceScore,
-    Severity,
-    MITRE_Tactics,
-    MITRE_Techniques,
-    Reason,
-    ThreatHunterDirectives
-| order by ConfidenceScore desc, LastSeen desc
+// 6 — Analyst reasoning
+| extend Reason = strcat(
+      iif(HasTooling == 1, strcat("Kerberos tooling observed (", ToolSample, "). "), ""),
+      iif(IsHighValue == 1, "High-value account involved. ", ""),
+      iif(AnySensitiveSPN == 1, "Access to sensitive SPNs (cifs/host/ldap/sql/http/termsrv). ", ""),
+      iif(AnyWeakEnc == 1, "Weak RC4/DES Kerberos encryption used. ", ""),
+      iif(AnyCrossHost == 1, "Cross-host ticket use (possible replay). ", "")
+)
+
+// 7 — Directives
+| extend Directives = case(
+      Severity == "High",
+         "Probable Pass-the-Ticket or forged ticket usage. Review LSASS access, inspect Kerberos tooling, validate ticket source and SPN legitimacy, isolate host if required.",
+      Severity == "Medium",
+         "Investigate account behaviour. Check host process history, correlate with LSASS access, evaluate ticket legitimacy and SPN usage.",
+      Severity == "Low",
+         "Baseline candidate. Validate expected service behaviour; monitor for escalation.",
+      "Context-only signal for hunters."
+)
+
+// Final output
+| where Severity in ("High","Medium")
+| project FirstSeen, LastSeen, DurationMinutes,
+          Host, UPN, UniqueSPNs, SPNSample,
+          HasTooling, ToolSample,
+          Severity, Reason, Directives
+| order by LastSeen desc
+
 
 ```
 
