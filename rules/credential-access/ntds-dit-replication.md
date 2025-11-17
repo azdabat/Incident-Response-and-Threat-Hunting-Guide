@@ -10,87 +10,106 @@ NTDS.dit Replication / DCSync-like is detected using pure native telemetry (no e
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// =============================
-// DCSync / NTDS.dit Replication – Native L3 Detection
+// DCSync / NTDS.dit Replication – L3 Native Detection
 // MITRE: T1003.006 (DCSync), T1003.003 (NTDS.dit)
-// Author: Ala Dabat (Alstrum)
-// =============================
+// Author: Ala Dabat | 2025-11
 
 let lookback = 14d;
 
-// AD Replication permissions that only DCs should hold
-let replicationRights = dynamic([
+let ReplicationRights = dynamic([
     "DS-Replication-Get-Changes",
     "DS-Replication-Get-Changes-All",
     "DS-Replication-Get-Changes-In-Filtered-Set"
 ]);
 
-// Processes often used to invoke DCSync
-let dcsync_tools = dynamic([
-    "mimikatz.exe", "rubeus.exe", "powershell.exe",
-    "sharpsec.exe", "lsadump.exe", "adexploit.exe"
+let DCSyncTools = dynamic([
+    "mimikatz.exe","rubeus.exe","powershell.exe",
+    "sharpsec.exe","lsadump.exe","adexploit.exe"
 ]);
 
-// 1. Permission abuse (Event 4662)
-let perm_abuse =
+// 1 — AD 4662 replication permission use (only DCs should do this)
+let ReplicationEvents =
 SecurityEvent
 | where TimeGenerated >= ago(lookback)
 | where EventID == 4662
-| where ObjectName has "Domain" or ObjectName has "Directory"
-| where AccessMaskName has_any (replicationRights)
-| project Timestamp=TimeGenerated, AccountName, SubjectUserName, SubjectLogonId,
-          ObjectName, AccessMaskName, DeviceName=Computer;
+| where AccessMaskName has_any (ReplicationRights)
+| project Time=TimeGenerated,
+          DeviceName=Computer,
+          Account=SubjectUserName,
+          ObjectName, AccessMaskName;
 
-// 2. Kerberos signs of DCSync prep (krbtgt tgt/tgs)
-let krb_abuse =
+// 2 — Kerberos anomalies (krbtgt TGS/TGT = common DCSync prep)
+let Kerb =
 SecurityEvent
 | where TimeGenerated >= ago(lookback)
-| where EventID == 4769 or EventID == 4768
+| where EventID in (4768,4769)
 | where ServiceName has_any ("krbtgt","KRBTGT")
-| project Timestamp=TimeGenerated, AccountName, DeviceName=Computer,
+| project Time=TimeGenerated,
+          DeviceName=Computer, Account,
           ServiceName, TicketOptions;
 
-// 3. Endpoint process correlation
-let proc_hits =
+// 3 — Local tooling on endpoints
+let ProcHits =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName in (dcsync_tools)
-      or ProcessCommandLine has_any ("lsadump","dcsync","GetNCChanges")
-| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine;
+| where FileName in (DCSyncTools)
+   or ProcessCommandLine has_any ("dcsync","lsadump","GetNCChanges")
+| project Time=Timestamp, DeviceName, AccountName, Tool=FileName, Cmd=ProcessCommandLine;
 
-// 4. RPC/LDAP traffic anomalies
-let rpc_ldap =
+// 4 — RPC/LDAP traffic to DCs from suspicious processes
+let RpcLdap =
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | where RemotePort in (135,389,3268,3269)
-| where InitiatingProcessFileName !in ("lsass.exe","winlogon.exe","services.exe")
-| project Timestamp, DeviceName, AccountName, RemoteIP, RemotePort,
-          InitiatingProcessFileName, InitiatingProcessCommandLine;
+| where InitiatingProcessFileName !in ("lsass.exe","services.exe","winlogon.exe")
+| project Time=Timestamp, DeviceName, AccountName,
+          RemoteIP, RemotePort,
+          Proc=InitiatingProcessFileName, Cmd=InitiatingProcessCommandLine;
 
-// Final correlation
-perm_abuse
-| join kind=leftouter krb_abuse on DeviceName
-| join kind=leftouter proc_hits on DeviceName
-| join kind=leftouter rpc_ldap on DeviceName
-| extend HasTooling = iif(isnotempty(FileName), 1, 0),
-         KerberosAnomaly = iif(ServiceName has "krbtgt", 1, 0),
-         LDAPAnomaly = iif(isnotempty(RemoteIP), 1, 0),
-         ReplicationEvent = iif(isnotempty(AccessMaskName), 1, 0)
-| extend ConfidenceScore =
-    5 * ReplicationEvent +
-    3 * KerberosAnomaly +
-    3 * HasTooling +
-    2 * LDAPAnomaly
+// --- Final correlation ---
+ReplicationEvents
+| join kind=leftouter Kerb      on DeviceName
+| join kind=leftouter ProcHits  on DeviceName
+| join kind=leftouter RpcLdap   on DeviceName
+
+| extend HasReplication = isnotempty(AccessMaskName),
+         HasKerb = isnotempty(ServiceName),
+         HasTool = isnotempty(Tool),
+         HasLDAP = isnotempty(RemoteIP)
+
+// Severity logic (no weighted scoring needed)
+| extend Severity = case(
+      HasReplication and (HasTool or HasKerb or HasLDAP), "High",
+      HasReplication, "Medium",
+      HasKerb or HasTool, "Low",
+      "Informational"
+)
+
 | extend Reason = strcat(
-    iif(ReplicationEvent == 1, "AD replication permissions from non-DC. ", ""),
-    iif(KerberosAnomaly == 1, "Suspicious KRBTGT ticket request. ", ""),
-    iif(HasTool
+      iif(HasReplication, "Non-DC used AD replication rights. ", ""),
+      iif(HasKerb, "krbtgt ticket request anomaly. ", ""),
+      iif(HasTool, strcat("Potential DCSync tooling: ", Tool, ". "), ""),
+      iif(HasLDAP, "Direct RPC/LDAP calls to DC services. ", "")
+)
 
-```
+| extend Directives = case(
+      Severity == "High",
+          "Treat as likely DCSync attempt. Review DC logs, isolate involved endpoints, inspect account activity, check for DC shadowing or privilege abuse.",
+      Severity == "Medium",
+          "Verify if the host is a legitimate DC or delegated admin system. Review change records and correlate with recent privilege changes.",
+      "Baseline check. Validate if any third-party IAM tools or backup solutions use these rights."
+)
+
+| project Time, DeviceName, Account,
+          HasReplication, HasKerb, HasTool, HasLDAP,
+          Tool, Cmd,
+          Severity, Reason, Directives
+| order by Time desc
+
 
 Additional Query for NTDS.dit exfiltration, Kerberos attack vectors.
 
-```
+```kql
 // ===========================================================================
 // NTDS.dit Replication / DCSync + ShadowCopy Exfil — L3 Native Detection Rule
 // Author: Ala Dabat (Alstrum) | Version: 2025-11
@@ -183,9 +202,8 @@ DeviceFileEvents
     InitiatingProcessCommandLine,
     FolderPath,
     FileName;
-
-// -------------------- Stage 5 —
 ```
+
 | Attack                                                       | Coverage        | Why                                               |
 | ------------------------------------------------------------ | --------------- | ------------------------------------------------- |
 | DCSync using Mimikatz/Rubeus                                 | **High**        | 4662 + RPC + krbtgt patterns + tooling            |
