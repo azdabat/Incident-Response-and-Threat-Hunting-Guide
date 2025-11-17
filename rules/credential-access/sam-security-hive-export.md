@@ -75,34 +75,21 @@ This is a **pure native, signatureless, high-fidelity** detection designed for S
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// =======================================================================
-// SAM / SECURITY / SYSTEM Hive Extraction — L3 Native Detection (Noise-Reduced)
-// Author: Ala Dabat (Alstrum)
+// SAM / SECURITY / SYSTEM Hive Extraction — L3 Native Detection
 // MITRE: T1003.002 (Registry Hives), T1003.006, T1059, T1055
-// =======================================================================
+// Author: Ala Dabat | 2025-11
 
 let lookback = 14d;
 
-// Host role suppression (optional)
 let KnownBackupAgents = dynamic(["veeam","azurebackup","commvault","sccm","intune"]);
 let KnownBackupProcesses = dynamic(["veeamagent.exe","vssvc.exe","sqlvsswriter.exe"]);
 
-// Minimalising noise: only evaluate hive paths My
-let HivePaths = dynamic([
-    @"\windows\system32\config\sam",
-    @"\windows\system32\config\system",
-    @"\windows\system32\config\security"
-]);
-
-// Tools strongly associated with hive theft
 let HiveTheftTools = dynamic([
     "mimikatz.exe","secretsdump.py","impacket-secretsdump.exe","lsassy.exe",
     "rubeus.exe","kekeo.exe","diskshadow.exe","vssadmin.exe","esentutl.exe"
 ]);
 
-// ------------------------------
-// 1. TRUE hive access events
-// ------------------------------
+// 1 — True hive access events (SAM / SYSTEM / SECURITY)
 let HiveAccess =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
@@ -110,77 +97,64 @@ DeviceFileEvents
 | where LPath has @"\windows\system32\config\"
 | where FileName in ("sam","system","security")
 | where ActionType in ("FileCopied","FileCreated","FileModified","FileDeleted")
-| project HiveTime = Timestamp, DeviceName, DeviceId,
-          HiveFileName = FileName,
-          HiveFolder = FolderPath;
+| project HiveTime=Timestamp, DeviceName, DeviceId,
+          HiveFile=FileName, HiveFolder=FolderPath;
 
-// ------------------------------
-// 2. Suspicious processes touching hive extraction tooling
-// ------------------------------
-let Proc =
+// 2 — Processes associated with hive extraction or shadow copy tools
+let ProcHits =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| extend Cmd = tostring(ProcessCommandLine), Parent = tostring(InitiatingProcessFileName)
+| extend Cmd=tostring(ProcessCommandLine),
+         Parent=tostring(InitiatingProcessFileName),
+         LowerCmd=tolower(ProcessCommandLine)
 | where FileName in (HiveTheftTools)
-    or Cmd has_any ("reg save","reg export","save hklm","ntdsutil","esentutl","shadow","vssadmin")
+   or LowerCmd has_any ("reg save","reg export","save hklm","ntdsutil","esentutl","shadow","vssadmin")
 | where FileName !in (KnownBackupProcesses)
-| project ProcTime = Timestamp, DeviceName, AccountName,
-          FileName, Cmd, Parent;
+| project ProcTime=Timestamp, DeviceName, AccountName,
+          Proc=FileName, Cmd, Parent;
 
-// ------------------------------
-// 3. Correlation: Process → Hive Access
-// ------------------------------
+// 3 — Correlate tooling with hive access
 HiveAccess
-| join kind=inner (Proc) on DeviceName
+| join kind=inner (ProcHits) on DeviceName
 | where HiveTime between (ProcTime .. ProcTime + 10m)
 
-// ------------------------------
-// 4. Behaviour scoring (noise-tuned)
-// ------------------------------
-| extend ConfidenceScore =
-    70
-    + 10  // true hive access
-    + iif(FileName in (HiveTheftTools), 10, 0)
-    + iif(Cmd has_any ("save hklm","reg save","reg export"), 8, 0)
-    + iif(Cmd has_any ("diskshadow","vssadmin","shadowcopy"), 6, 0)
-    + iif(Parent in ("powershell.exe","cmd.exe"), 3, 0)
+// 4 — Behaviour classification (no weighted scoring)
+| extend
+     HasKnownTool = Proc in (HiveTheftTools),
+     UsesRegSave  = Cmd has_any ("reg save","reg export","save hklm"),
+     UsesShadow   = Cmd has_any ("diskshadow","vssadmin","shadow"),
+     SuspParent   = Parent in ("powershell.exe","cmd.exe")
 
-// ------------------------------
-// 5. Severity Mapping
-// ------------------------------
 | extend Severity = case(
-    ConfidenceScore >= 90, "High",
-    ConfidenceScore >= 80, "Medium",
-    "Low"
+      HasKnownTool == 1 and UsesRegSave == 1,       "High",
+      HasKnownTool == 1 and UsesShadow == 1,        "High",
+      HasKnownTool == 1,                            "High",
+      UsesRegSave == 1 or UsesShadow == 1,          "Medium",
+      SuspParent == 1,                              "Medium",
+      "Low"
 )
 
-// ------------------------------
-// 6. Hunter Directives
-// ------------------------------
-| extend HuntingDirectives = strcat(
-    "Severity=", Severity,
-    "; Device=", DeviceName,
-    "; Hive=", HiveFileName,
-    "; Tool=", FileName,
-    "; Command=", Cmd,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High",
-            "Strong indicator of credential hive extraction. Isolate host. Acquire forensic image. Review LSASS access, VSS usage, and recent lateral movement.",
-        Severity == "Medium",
-            "Investigate process lineage and validate if backup software is misidentified. Review account context and scheduled tasks.",
-        "Baseline behaviour. Tune out known backup tools."
-    )
+| extend Reason = strcat(
+      iif(HasKnownTool,  strcat("Hive extraction tool (", Proc, ") used. "), ""),
+      iif(UsesRegSave,   "Registry save/export command. ", ""),
+      iif(UsesShadow,    "Shadow copy / VSS usage. ", ""),
+      iif(SuspParent,    strcat("Suspicious parent process: ", Parent, ". "), "")
 )
 
-// ------------------------------
-// 7. Final output
-// ------------------------------
+| extend NextSteps = case(
+      Severity == "High",
+          "Likely hive extraction. Isolate host, acquire forensic image, review LSASS access, check for lateral movement, inspect VSS/shadow activity.",
+      Severity == "Medium",
+          "Investigate process tree and validate backup context. Check account, scheduled tasks, and command lines.",
+      "Baseline candidate; tune backup tools or agent processes."
+)
+
+// Final output
 | project HiveTime, DeviceName, AccountName,
-          HiveFileName, HiveFolder,
-          FileName, Cmd, Parent,
-          ConfidenceScore, Severity, HuntingDirectives
-| order by ConfidenceScore desc
+          HiveFile, HiveFolder,
+          Proc, Cmd, Parent,
+          Severity, Reason, NextSteps
+| order by HiveTime desc
 
 ```
 
