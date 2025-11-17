@@ -253,58 +253,6 @@ f
 
 ```
 
-```
-// =============================================================
-// Archive Creation in Suspicious Directories – Data Exfil & Ransomware Prep
-// =============================================================
-
-let lookback = 14d;
-let archive_ext = dynamic([".zip",".7z",".rar",".gz",".tar"]);
-let suspicious_paths = dynamic(["C:\\Users\\","C:\\Temp\\","C:\\Windows\\Temp\\","C:\\ProgramData\\"]);
-let archivers = dynamic(["7z.exe","winrar.exe","powershell.exe","cmd.exe","rar.exe","zip.exe"]);
-
-let f =
-DeviceFileEvents
-| where Timestamp >= ago(lookback)
-| extend ext = tolower(split(FileName,".",-1)[-1])
-| where FileName has_any (archive_ext)
-| where FolderPath has_any (suspicious_paths)
-| project ArchiveTime = Timestamp, DeviceName, DeviceId,
-          ArchiveName = FileName, ArchivePath = FolderPath, InitiatingProcessFileName;
-
-let p =
-DeviceProcessEvents
-| where Timestamp >= ago(lookback)
-| where FileName in (archivers)
-| project ProcTime = Timestamp, DeviceId, ProcName = FileName, ProcCmd = ProcessCommandLine;
-
-f
-| join kind=leftouter p on DeviceId
-| extend FastArchive = iif(abs(datetime_diff("minute",ArchiveTime,ProcTime)) <= 5,1,0)
-| extend ConfidenceScore =
-      iif(FastArchive == 1,3,0)
-    + iif(ArchivePath has "Users",2,0)
-    + iif(ArchivePath has "Temp",2,0)
-| extend Reason = case(
-    FastArchive == 1, "Archive created immediately after archiver execution",
-    ArchivePath has "Users", "Archive created under user profile",
-    ArchivePath has "Temp",  "Archive created in temp path",
-    "Suspicious archive creation"
-)
-| extend ThreatHunterDirective = case(
-    ConfidenceScore >= 6, "HIGH: Potential data staging for exfiltration or ransomware prep.",
-    ConfidenceScore >= 4, "MEDIUM: Review parent process lineage and accessed files.",
-    "LOW"
-)
-| extend MITRE_Techniques = "T1560 (Archive Collected Data)"
-| project ArchiveTime, DeviceName, ArchiveName, ArchivePath, ProcName, ProcCmd,
-          FastArchive, ConfidenceScore, Reason, MITRE_Techniques, ThreatHunterDirective
-| where ConfidenceScore >= 4
-| order by ArchiveTime desc
-
-```
-
-
 The query exposes:
 
 - `ConfidenceScore` – behaviour-based strength of the signal.
