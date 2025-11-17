@@ -16,7 +16,7 @@ Long-lived HTTPS tunnels (reverse shells / SOCKS over 443) fronted by powershell
 ```kql
 // ===================================================================
 // Suspicious 443 Beacon Patterns — L3 Native
-// Author: Ala Dabat (Alstrum) | Version: 2025-11
+// Author: Ala Dabat  | Version: 2025-11
 // Platform: Microsoft Sentinel / MDE Advanced Hunting
 // Category: c2
 // Purpose: Detect HTTPS (443) beacon-like C2 traffic using only
