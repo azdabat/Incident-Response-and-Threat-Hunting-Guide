@@ -10,142 +10,141 @@ RDP Lateral Movement is detected using pure native telemetry (no external TI) at
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// =====================================
-// Advanced RDP Attack Patterns - L3 Detection
-// Author: Ala Dabat | Version: 2025-11 | Platform: Microsoft Sentinel / MDE
-// Purpose: Detect RDP-based lateral movement, credential dumping, recon and persistence
-// MITRE: T1021.001 (RDP), T1003.001 (LSASS Dumping), T1053.005 (Scheduled Task), T1570 (Lateral Tool Transfer), T1018 (Discovery)
-// =====================================
+// ==========================================================================
+//  Advanced RDP Lateral Movement & Credential Abuse – L3 Detection
+//  Author: Ala Dabat (Alstrum) — 2025 Native Endpoint/Identity Pack
+//  Purpose: Detect multi-stage RDP abuse: recon, LSASS dumping, DCSync prep,
+//           tool transfer, persistence, and post-login pivots.
+//  MITRE: T1021.001 (RDP), T1003.001 (LSASS), T1003.006 (DCSync),
+//         T1053.005 (Scheduled Tasks), T1570 (Tool Transfer), T1018 (Discovery)
+// ==========================================================================
 
 let lookback = 7d;
 
-// ===== 1. RDP SESSION DETECTION (NETWORK LAYER) =====
+// Optional tuning for legitimate admin hosts
+let KnownAdminSubnets = dynamic(["10.0.0.", "192.168.1."]);  
+
+// ---------------------------------------------------------------------------
+// 1. RDP SESSION DETECTION (Network-layer truth)
+// ---------------------------------------------------------------------------
 let RDPSessions =
-    DeviceNetworkEvents
-    | where Timestamp >= ago(lookback)
-    | where RemotePort == 3389 or LocalPort == 3389    // Standard RDP port
-    | where ActionType in ("ConnectionSuccess","InboundConnectionAccepted")
-    | extend RDP_Direction = iff(RemotePort == 3389, "Outbound", "Inbound")
-    | project
-        RDPTime       = Timestamp,
-        DeviceId,
-        DeviceName,
-        RDP_RemoteIP  = RemoteIP,
-        RDP_LocalIP   = LocalIP,
-        RDP_Direction,
-        ActionType;
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where RemotePort == 3389 or LocalPort == 3389
+| where ActionType in ("ConnectionSuccess","InboundConnectionAccepted")
+| extend RDP_Direction = iff(RemotePort == 3389, "Outbound", "Inbound")
+| extend RDP_SourceIP  = iff(RDP_Direction == "Outbound", RemoteIP, LocalIP)
+| project RDPTime      = Timestamp,
+          DeviceId,
+          DeviceName,
+          RDP_SourceIP,
+          RDP_Direction,
+          ActionType;
 
-// ===== 2. SUSPICIOUS PROCESS ACTIVITY IN RDP SESSIONS =====
-let SuspiciousRDPProcesses =
-    DeviceProcessEvents
-    | where Timestamp >= ago(lookback)
-    // Processes that ran in a remote (RDP) session
-    | where IsInitiatingProcessRemoteSession == true
-    | extend RDP_SessionIP = tostring(InitiatingProcessRemoteSessionIP)
-    // Credential dumping from RDP session
-    | extend IsRDPCredentialDump =
-        iif(FileName =~ "mimikatz.exe"
-            or ProcessCommandLine has "sekurlsa::logonpasswords"
-            or (ProcessCommandLine has "lsass" and FileName in~ ("procdump.exe","sqldumper.exe")),
-            1, 0)
-    // Recon / situational awareness via RDP
-    | extend IsRDPRecon =
-        iif(ProcessCommandLine has_any ("net user","net group","net localgroup","quser","qwinsta")
-            or ProcessCommandLine has_any ("whoami /groups","whoami /priv","systeminfo"),
-            1, 0)
-    // Lateral tool transfer / remote tool execution
-    | extend IsRDPToolTransfer =
-        iif(FileName in~ ("psexec.exe","wmic.exe","sc.exe")
-            and ProcessCommandLine has_any ("\\\\"," create "," start "),
-            1, 0)
-    // Persistence establishment from RDP
-    | extend IsRDPPersistence =
-        iif(ProcessCommandLine has_any ("schtasks"," at ","wmic ")
-            and ProcessCommandLine has_any (" /create "," create "," start ")
-            and ProcessCommandLine contains ".exe",
-            1, 0)
-    | project
-        ProcTime      = Timestamp,
-        DeviceId,
-        DeviceName,
-        RDP_SessionIP,
-        FileName,
-        ProcessCommandLine,
-        IsRDPCredentialDump,
-        IsRDPRecon,
-        IsRDPToolTransfer,
-        IsRDPPersistence;
+// ---------------------------------------------------------------------------
+// 2. SUSPICIOUS BEHAVIOUR EXECUTED *INSIDE* AN RDP SESSION
+// ---------------------------------------------------------------------------
+let RDPProc =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where IsInitiatingProcessRemoteSession == true  // TRUE RDP-bound process
+| extend RDP_SessionIP = tostring(InitiatingProcessRemoteSessionIP)
+| extend Cmd = tostring(ProcessCommandLine)
+| extend Proc = FileName
 
-// ===== 3. CORRELATE RDP SESSIONS WITH SUSPICIOUS ACTIVITY =====
+// Credential dumping (LSASS → procdump, mimikatz, sqldumper)
+| extend IsLSASSDump =
+      (Proc in~ ("mimikatz.exe","procdump.exe","procdump64.exe","dumpert.exe"))
+      or (Cmd has "sekurlsa::")
+      or (Cmd has "lsass" and Proc in~ ("procdump.exe","sqldumper.exe"))
+
+// DCSync prep (rare but happens inside RDP sessions)
+| extend IsDCSyncPrep =
+      Cmd has_any ("dcsync","GetNCChanges","lsadump","DirectoryServices")
+
+// Recon
+| extend IsRecon =
+      Cmd has_any ("net user","net group","quser","qwinsta","whoami","systeminfo")
+
+// Lateral movement tooling
+| extend IsToolTransfer =
+      (Proc in~ ("psexec.exe","wmic.exe","sc.exe"))
+      and Cmd has @"\\"
+
+// Persistence
+| extend IsPersistence =
+      Cmd has_any ("schtasks"," /create ","registry","SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run")
+
+// Remote file operations common after RDP compromise
+| extend IsFilePull =
+      Cmd has_any ("copy \\\\", "move \\\\", "robocopy \\\\")
+
+| project ProcTime = Timestamp,
+          DeviceId, DeviceName, RDP_SessionIP,
+          Proc, Cmd,
+          IsLSASSDump, IsDCSyncPrep,
+          IsRecon, IsToolTransfer,
+          IsPersistence, IsFilePull;
+
+// ---------------------------------------------------------------------------
+// 3. CORRELATE SUSPICIOUS ACTIVITY WITH ACTIVE RDP SESSION
+// ---------------------------------------------------------------------------
 RDPSessions
-| join kind=inner SuspiciousRDPProcesses on DeviceId
-// Activity must occur within 30 minutes of the RDP session
-| where ProcTime between (RDPTime .. RDPTime + 30m)
+| join kind=inner RDPProc on DeviceId
+| where ProcTime between (RDPTime .. RDPTime + 45m)   // wider window for realistic RDP abuse
 
-// ===== 4. CONFIDENCE SCORING =====
-| extend ConfidenceScore = case(
-    IsRDPCredentialDump == 1,                         10,  // CRITICAL: RDP + LSASS/credential dumping
-    IsRDPPersistence == 1 or IsRDPToolTransfer == 1,  9,   // HIGH: persistence or lateral tool transfer via RDP
-    IsRDPRecon == 1 and RDP_Direction == "Inbound",   8,   // MED-HIGH: recon on inbound RDP
-    IsRDPRecon == 1,                                  7,   // MED: recon from any RDP session
-    5                                                      // LOW: any suspicious RDP-session process
-)
-
-// ===== 5. THREAT CONTEXT & MITRE MAPPING =====
-| extend ThreatContext = case(
-    ConfidenceScore == 10, "Credential dumping from within an RDP session – likely preparing for wider lateral movement.",
-    ConfidenceScore == 9,  "Persistence or lateral movement tooling executed via RDP (scheduled tasks, psexec/wmic/sc).",
-    ConfidenceScore == 8,  "Discovery and reconnaissance commands run inside an inbound RDP session.",
-    ConfidenceScore == 7,  "Reconnaissance commands executed within an RDP session.",
-    "Suspicious process execution in an active RDP session."
-)
-| extend MITRE_Techniques = case(
-    IsRDPCredentialDump == 1, "T1003.001 (LSASS Dumping), T1021.001 (RDP)",
-    IsRDPPersistence == 1,    "T1053.005 (Scheduled Task), T1021.001 (RDP)",
-    IsRDPToolTransfer == 1,   "T1570 (Lateral Tool Transfer), T1021.001 (RDP)",
-    IsRDPRecon == 1,          "T1018 (Remote System Discovery), T1021.001 (RDP)",
-    "T1021.001 (Remote Desktop Protocol)"
-)
-
-// ===== 6. SEVERITY & HUNTING DIRECTIVES =====
+// ---------------------------------------------------------------------------
+// 4. BEHAVIOUR → SEVERITY (No scoring requirement, L3 logic)
+// ---------------------------------------------------------------------------
 | extend Severity = case(
-    ConfidenceScore >= 9, "High",
-    ConfidenceScore >= 7, "Medium",
-    "Low"
-)
-| extend HuntingDirectives = strcat(
-    "Severity=", Severity,
-    "; RDPDirection=", RDP_Direction,
-    "; SessionIP=", coalesce(RDP_SessionIP, RDP_RemoteIP),
-    "; Device=", DeviceName,
-    "; SuspiciousProcess=", FileName,
-    "; CoreContext=", ThreatContext,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High",
-            "Confirm whether the RDP session is expected. Immediately review full process tree and user context. Pivot to DeviceLogonEvents for interactive logons, check for LSASS access, outbound lateral connections and new persistence. If activity is not explicitly authorised, terminate any active RDP sessions, reset affected credentials, and block the source IP.",
-        Severity == "Medium",
-            "Validate whether this RDP session and associated commands are part of legitimate admin activity. Pivot around DeviceNetworkEvents for subsequent SMB/WinRM connections and DeviceProcessEvents for tool execution. Consider temporary network blocks or session termination if behaviour is suspicious.",
-        "Baseline behaviour for this host/user if legitimate remote admin activity is confirmed. Keep as a hunting signal and correlate with other alerts for escalation."
-    )
+      IsLSASSDump == 1 or IsDCSyncPrep == 1,               "High",
+      IsToolTransfer == 1 or IsPersistence == 1,           "High",
+      IsRecon == 1 and RDP_Direction == "Inbound",         "Medium",
+      IsFilePull == 1,                                      "Medium",
+      IsRecon == 1,                                         "Low",
+      "Low"
 )
 
-// ===== 7. FINAL PROJECTION =====
-| where ConfidenceScore >= 7    // Focus on Medium and High
-| project
-    RDP_StartTime   = RDPTime,
-    ProcTime,
-    DeviceName,
-    RDP_Direction,
-    RDP_SourceIP    = coalesce(RDP_SessionIP, RDP_RemoteIP),
-    SuspiciousProcess = FileName,
-    ProcessCommandLine,
-    ThreatContext,
-    MITRE_Techniques,
-    ConfidenceScore,
-    Severity,
-    HuntingDirectives
-| order by ConfidenceScore desc, ProcTime desc
+// ---------------------------------------------------------------------------
+// 5. Reasoning (Human SOC Analyst Style)
+// ---------------------------------------------------------------------------
+| extend Reason = strcat(
+      iif(IsLSASSDump,      "LSASS/credential dumping executed inside active RDP session. ", ""),
+      iif(IsDCSyncPrep,     "DCSync-related commands run via RDP. ", ""),
+      iif(IsToolTransfer,   "Lateral movement tooling invoked inside RDP. ", ""),
+      iif(IsPersistence,    "Persistence mechanism created from RDP session. ", ""),
+      iif(IsFilePull,       "Remote copy/move operations observed. ", ""),
+      iif(IsRecon,          "Reconnaissance commands executed inside RDP session. ", ""),
+      "RDP direction: ", RDP_Direction, ". "
+)
+
+// ---------------------------------------------------------------------------
+// 6. L3 Hunting Directives (human-written, actionable)
+// ---------------------------------------------------------------------------
+| extend HuntingDirectives = strcat(
+      "Severity=", Severity,
+      "; Device=", DeviceName,
+      "; SourceIP=", RDP_SourceIP,
+      "; ObservedProcess=", Proc,
+      "; Reason=", Reason,
+      "; NextSteps=",
+      case(
+          Severity == "High",
+              "Treat as probable RDP compromise. Validate whether the session was expected. Pull full process tree, check for LSASS access, persistence artefacts, tool transfer, outbound SMB/WMI, and new scheduled tasks. Consider isolating host and resetting credentials.",
+          Severity == "Medium",
+              "Validate operator legitimacy. Review session origin, command-line intent, file access, and SMB/WMI pivots. Check for escalation behaviours.",
+          "Likely benign admin activity if justified — retain for hunting, correlate with other detections."
+      )
+)
+
+// ---------------------------------------------------------------------------
+| where Severity in ("High","Medium")
+| project RDPTime, ProcTime,
+          DeviceName, RDP_Direction, RDP_SourceIP,
+          Proc, Cmd,
+          Reason, Severity, HuntingDirectives
+| order by Severity desc, ProcTime desc
+
 
 ```
 
