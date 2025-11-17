@@ -114,4 +114,4 @@ The Log Forwarding Imperative: Highlight that in a log clearing scenario, local 
 
 Targeting the Impact: Emphasize that T1490 (Shadow Copy Deletion) is a primary indicator of a Ransomware payload being deployed next. Prioritizing the isolation and binary blocking of the process that deletes VSS is the most effective containment action against data encryption.
 
-Defense Through Restriction: Your remediation strategy shows maturity by moving past simple detection to Proactive Prevention. Restricting the execution of administrative utilities like vssadmin.exe with specific malicious arguments is the most powerful control against this particular TTP.
+Defense Through Restriction: Your remediation strategy should show maturity by moving past simple detection to Proactive Prevention. Restricting the execution of administrative utilities like vssadmin.exe with specific malicious arguments is the most powerful control against this particular TTP.
