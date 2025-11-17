@@ -42,154 +42,111 @@ The rule correlates multiple independent signals:
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// ========================================================================
-// LSASS Credential Dumping – L3 Native Detection (Noise-Reduced)
-// Author: Ala Dabat 
-// MITRE: T1003.001 (LSASS Dump), T1055 (Process Injection)
-// ========================================================================
+// LSASS Credential Dumping — L3 Native
+// Author: Ala Dabat | 2025-11
 
 let lookback = 14d;
 
-// -----------------------------
-// 0. Known benign LSASS dump users (tune per environment)
-// -----------------------------
-let KnownSafeProcesses = dynamic([
-    "taskmgr.exe",      // Task Manager
-    "procexp.exe",      // Sysinternals Process Explorer
-    "procexp64.exe",
-    "msmpeng.exe",      // Defender
-    "senseIR.exe",      // Defender for Endpoint
-    "lsass.exe"         // Allowed self-access
+let SafeProcs = dynamic([
+    "taskmgr.exe","procexp.exe","procexp64.exe",
+    "msmpeng.exe","senseIR.exe","lsass.exe"
 ]);
 
-let KnownBackupTools = dynamic([
-    "veeamagent.exe","veeamservice.exe",
-    "sqlvsswriter.exe","vssvc.exe", "wbengine.exe"
+let BackupTools = dynamic([
+    "veeamagent.exe","veeamservice.exe","sqlvsswriter.exe","vssvc.exe","wbengine.exe"
 ]);
 
-let KnownMonitoringTools = dynamic([
+let MonitoringTools = dynamic([
     "splunkd.exe","qualys.exe","tanium.exe","crowdstrike.exe"
 ]);
 
-// -----------------------------
-// 1. TRUE LSASS access via handle opens (high fidelity)
-// -----------------------------
+let DumpTools = dynamic([
+    "procdump.exe","procdump64.exe","nanodump.exe","nanodump64.exe",
+    "mimikatz.exe","lsassy.exe","dumpert.exe","dmp.exe","secretsdump.py","outflank.dll"
+]);
+
+// 1. LSASS access via command line reference (first indicator)
 let LsassAccess =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName !in (KnownSafeProcesses)
-| where InitiatingProcessFileName !in (KnownSafeProcesses)
-| extend Cmd = tostring(ProcessCommandLine)
-| where ProcessCommandLine has "lsass" 
-    or InitiatingProcessCommandLine has "lsass"
-    or Cmd has "lsass"
-| project LsassTime = Timestamp,
-          DeviceId, DeviceName, AccountName,
-          Proc = FileName, Cmd,
-          Parent = InitiatingProcessFileName;
+| where FileName !in (SafeProcs)
+| where InitiatingProcessFileName !in (SafeProcs)
+| extend Cmd=tostring(ProcessCommandLine)
+| where Cmd has "lsass" or InitiatingProcessCommandLine has "lsass"
+| project Time=Timestamp, DeviceId, DeviceName, AccountName,
+          Proc=FileName, Cmd,
+          Parent=InitiatingProcessFileName;
 
-// -----------------------------
-// 2. Dump-related DLL load correlation
-// -----------------------------
-let DumpDllLoads =
+// 2. Dump-related DLL loads (high-fidelity correlation)
+let DumpDll =
 DeviceImageLoadEvents
 | where Timestamp >= ago(lookback)
 | where ImageFileName has_any ("dbghelp","comsvcs","minidump","dbgcore")
-| where InitiatingProcessFileName !in (KnownSafeProcesses)
-| project DllTime = Timestamp,
-          DeviceId, DeviceName,
-          ImageFileName, Proc = InitiatingProcessFileName;
+| where InitiatingProcessFileName !in (SafeProcs)
+| project DeviceId, ImageFileName, DllTime=Timestamp;
 
-// -----------------------------
-// 3. Suspicious dumping tools / renamed binaries
-// -----------------------------
-let SuspiciousDumpTools =
-dynamic([
-    "procdump.exe","procdump64.exe",
-    "nanodump.exe","nanodump64.exe",
-    "mimikatz.exe","lsassy.exe",
-    "dumpert.exe","dmp.exe","secretsdump.py",
-    "outflank.dll"
-]);
-
-let ProcHits =
+// 3. Suspicious dump tools or dump switches
+let ToolHits =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
-| where FileName in (SuspiciousDumpTools)
-      or ProcessCommandLine has_any ("-ma","MiniDump","sekurlsa","dump")
-| where FileName !in (KnownSafeProcesses)
-| project HitTime = Timestamp, DeviceId, DeviceName, 
-          Proc = FileName, Cmd = ProcessCommandLine;
+| where FileName in (DumpTools)
+   or ProcessCommandLine has_any ("-ma","minidump","sekurlsa","dump")
+| where FileName !in (SafeProcs)
+| project DeviceId, HitTime=Timestamp,
+          HitProc=FileName, HitCmd=ProcessCommandLine;
 
-// -----------------------------
-// 4. Correlate LSASS access + dump DLL loads + dump tooling
-// -----------------------------
+// 4. Correlation
 LsassAccess
-| join kind=leftouter (DumpDllLoads) on DeviceId
-| join kind=leftouter (ProcHits)     on DeviceId
-| extend HasDumpDll = iif(isnotempty(ImageFileName), 1, 0)
-| extend HasDumpTool = iif(isnotempty(Proc1), 1, 0)
-| extend HasLsassAccess = 1
+| join kind=leftouter DumpDll on DeviceId
+| join kind=leftouter ToolHits on DeviceId
+| extend HasDumpDll = isnotempty(ImageFileName),
+         HasDumpTool = isnotempty(HitProc),
+         HasLsassAccess = 1
 
-// -----------------------------
-// 5. Scoring (noise-resistant)
-// -----------------------------
-| extend ConfidenceScore =
-    70
-    + iif(HasDumpTool == 1, 10, 0)
-    + iif(HasDumpDll == 1, 8, 0)
-    + iif(Cmd has_any ("-ma","minidump","sekurlsa"), 6, 0)
-    + iif(Parent in ("powershell.exe","cmd.exe","rundll32.exe","mshta.exe"), 4, 0)
+// 5. Scoring (simple, noise-resistant)
+| extend Score =
+      70
+      + iif(HasDumpTool, 15, 0)
+      + iif(HasDumpDll, 10, 0)
+      + iif(Cmd has_any ("-ma","minidump","sekurlsa"), 8, 0)
+      + iif(Parent in ("powershell.exe","cmd.exe","rundll32.exe","mshta.exe"), 5, 0)
 
-// -----------------------------
-// 6. Reason
-// -----------------------------
-| extend Reason = strcat(
-    iif(HasDumpTool == 1, strcat("Known LSASS dumping tool executed: ", Proc1, ". "), ""),
-    iif(HasDumpDll == 1, strcat("Dump-related DLL loaded: ", ImageFileName, ". "), ""),
-    iif(Cmd has_any ("-ma","minidump","sekurlsa"), "Dump switches detected. ", ""),
-    iif(Parent in ("powershell.exe","cmd.exe","rundll32.exe","mshta.exe"),
-        strcat("Suspicious parent: ", Parent, ". "), "")
-)
-
-// -----------------------------
-// 7. Severity
-// -----------------------------
+// 6. Severity
 | extend Severity = case(
-    ConfidenceScore >= 90, "High",
-    ConfidenceScore >= 80, "Medium",
-    ConfidenceScore >= 70, "Low",
-    "Informational"
+      Score >= 90, "High",
+      Score >= 80, "Medium",
+      "Low"
 )
 
-// -----------------------------
-// 8. Hunter Directives
-// -----------------------------
-| extend HuntingDirectives = strcat(
-    "Severity=", Severity,
-    "; Device=", DeviceName,
-    "; User=", AccountName,
-    "; Reason=", Reason,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High",
-            "Strong LSASS dumping indicator. Immediately isolate host. Review LSASS handle access, check for credential theft, correlate with DCSync/PTH/PTT attempts, collect full process tree and memory.",
-        Severity == "Medium",
-            "Investigate process lineage. Confirm if admin using legitimate tools. Check for unauthorized Sysinternals use. Pivot around process chain ±24h.",
-        "Review as potential baseline. Tune KnownSafeProcesses and KnownBackupTools."
-    )
+// 7. Directives
+| extend Directives = strcat(
+      "Severity=", Severity,
+      "; Host=", DeviceName,
+      "; User=", AccountName,
+      "; Reason=",
+         iif(HasDumpTool, strcat("DumpTool:", HitProc, "; "), ""),
+         iif(HasDumpDll, strcat("DumpDLL:", ImageFileName, "; "), ""),
+         iif(Cmd has_any ("-ma","minidump","sekurlsa"), "DumpSwitch; ", ""),
+         iif(Parent in ("powershell.exe","cmd.exe","rundll32.exe","mshta.exe"),
+             strcat("SuspiciousParent:", Parent, "; "), ""),
+      "; Action=",
+      case(
+          Severity == "High",
+              "Isolate host, review LSASS access, check for credential theft, collect memory, pivot for further lateral movement.",
+          Severity == "Medium",
+              "Validate admin activity, check process lineage, review Sysinternals use, pivot ±24h.",
+          "Baseline check; tune safe processes for environment."
+      )
 )
 
-// -----------------------------
-// 9. Final Filtering
-// -----------------------------
-| where ConfidenceScore >= 80       // Medium+ by default
-| project LsassTime, DeviceName, AccountName,
+// 8. Output
+| where Score >= 80
+| project Time, DeviceName, AccountName,
           Proc, Cmd, Parent,
           HasDumpDll, ImageFileName,
-          HasDumpTool, ConfidenceScore,
-          Severity, HuntingDirectives
-| order by ConfidenceScore desc, LsassTime desc
+          HasDumpTool, Score, Severity,
+          Directives
+| order by Score desc, Time desc
 
 ```
 
