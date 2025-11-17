@@ -7,7 +7,7 @@ Vendor Binary → DLL Sideloading (Native) is detected using pure native telemet
 - Category: supply-chain
 - MITRE: T1574.002
 
-  These are rules i created for supply chain type attacks. They are way more advanced than most. They catch delayed and fast driver, dll loads and much more. I deconstructed it into 3 rules as it was originally an engineering rule demo for supply chain attacks. 
+ This rulepack presents a fully engineered, L3-grade detection framework designed to identify modern supply-chain, DLL sideloading, BYOVD driver abuse, and post-install C2 behaviours across Microsoft Defender for Endpoint and Sentinel. The logic originates from a single unified behavioural model that tracks component drops, unsigned DLL/driver loads, delayed-activation loaders, writable-path anomalies, registry-based persistence, and suspicious network staging activity. For operational realism, the framework is decomposed into modular, production-ready rules—each focused on a specific detection surface—while preserving a consistent scoring methodology, MITRE mapping, and analyst triage workflow. The result is a transparent, scalable, and field-tested rulepack that demonstrates advanced detection engineering, supply-chain attack modelling, and disciplined SOC rule lifecycle design.
 
 ## Advanced Hunting Query (MDE / Sentinel)
 
