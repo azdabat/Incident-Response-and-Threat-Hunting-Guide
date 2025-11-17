@@ -1,4 +1,5 @@
 # SMB / PsExec-style ADMIN$ Lateral Movement – L3 Native Detection Rule
+(Rule detections on other sensitive shares also)
 
 ## Threat Focus
 
@@ -25,16 +26,20 @@ Worm-like behaviour when the same source hits many hosts in a short window
 // SMB Lateral Movement — Enhanced (NotPetya / PsExec / WMI / SCExec)
 // Author: Ala Dabat | Version: 2025-11
 // Platform: Microsoft Sentinel / MDE
-// Purpose: Detect SMB/ADMIN$-based lateral movement and tool propagation
-// using native telemetry only (no external TI).
-// MITRE: T1021.002 (SMB Admin Shares), T1569.002 (Service Execution), T1078 (Valid Accounts)
+// Purpose: Detect SMB/ADMIN$/hidden-share-based lateral movement and
+//          tool propagation using native telemetry only.
+// MITRE: T1021.002 (SMB Admin Shares), T1569.002 (Service Execution),
+//        T1078 (Valid Accounts)
 // ===================================================================
 
 // -------------------- Tunables --------------------
 let lookback = 7d;
 let corr_window = 15m;
 let propagation_threshold = 3;   // >=3 remote hosts = likely worm-style spread
-let procSet = dynamic(["psexec.exe","wmic.exe","powershell.exe","cmd.exe","sc.exe"]);
+let procSet = dynamic(["psexec.exe","psexesvc.exe","wmic.exe","powershell.exe","pwsh.exe","cmd.exe","sc.exe","wmiadap.exe"]);
+
+// Suspicious payload extensions
+let SuspiciousExt = dynamic([".exe",".dll",".sys",".ps1",".psm1",".vbs",".js",".jse",".bat",".cmd",".msi",".scr"]);
 
 // -------------------- SMB connection stage --------------------
 let SmbNet =
@@ -42,16 +47,25 @@ DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | where RemotePort == 445
 | where InitiatingProcessFileName in (procSet)
-| extend SmbProc = InitiatingProcessFileName, SmbCmd = InitiatingProcessCommandLine
+| extend SmbProc = InitiatingProcessFileName,
+         SmbCmd  = InitiatingProcessCommandLine
 | project SmbTime = Timestamp,
           DeviceId, DeviceName, RemoteIP, SmbProc, SmbCmd;
 
-// -------------------- ADMIN$ / C$ share writes --------------------
+// -------------------- Admin / hidden share writes --------------------
 let AdminShareWrites =
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
-| where FolderPath matches regex @"(?i)^\\\\[A-Za-z0-9_\.-]+\\(ADMIN\$|C\$)"
-| extend TargetHost = tostring(extract(@"\\\\([^\\]+)\\", 1, FolderPath))
+| extend LPath = tostring(FolderPath)
+// Matches UNC paths to ADMIN$, C$, IPC$, PRINT$, SYSVOL, NETLOGON,
+// and *any* hidden share that ends with $
+| where LPath matches regex @"(?i)^\\\\[^\\]+\\(ADMIN\$|C\$|IPC\$|PRINT\$|SYSVOL|NETLOGON)"
+   or LPath matches regex @"(?i)^\\\\[^\\]+\\[^\\]+\$"
+| extend TargetHost = tostring(extract(@"\\\\([^\\]+)\\", 1, LPath))
+// Focus on likely payloads / tools, not arbitrary files
+| extend LName = tolower(FileName),
+         Ext   = strcat(".", tostring(extract(@"([^.]+)$", 1, LName)))
+| where Ext in (SuspiciousExt)
 | project FileTime = Timestamp,
           DeviceName,
           DeviceId,
@@ -68,7 +82,7 @@ union
     DeviceProcessEvents
     | where Timestamp >= ago(lookback)
     | where FileName in ("psexesvc.exe","svchost.exe","services.exe")
-        or ProcessCommandLine has_any ("psexec", "\\\\", "\\ADMIN$", "sc.exe create", "sc.exe start")
+       or ProcessCommandLine has_any ("psexec","\\\\","\\ADMIN$","sc.exe create","sc.exe start")
     | project SvcTime = Timestamp,
               SvcHost = DeviceName,
               SvcFileName = FileName,
@@ -77,11 +91,12 @@ union
 ),
 (
     SecurityEvent
+    | where TimeGenerated >= ago(lookback)
     | where EventID == 7045  // Service created
-    | extend SvcTime = TimeGenerated,
-              SvcHost = Computer,
-              SvcCmd = tostring(EventData),
-              SvcFileName = "ServiceCreation",
+    | extend SvcTime      = TimeGenerated,
+              SvcHost      = Computer,
+              SvcCmd       = tostring(EventData),
+              SvcFileName  = "ServiceCreation",
               SvcInitiator = "System"
     | project SvcTime, SvcHost, SvcFileName, SvcCmd, SvcInitiator
 );
@@ -92,8 +107,8 @@ DnsEvents
 | where Timestamp >= ago(lookback)
 | project DnsTime = Timestamp,
           DeviceName,
-          RemoteIP = IPAddress,
-          ResolvedHost = Name;
+          RemoteIP,
+          ResolvedHost = DomainName;
 
 // -------------------- Optional auth correlation (sign-in IP → account) ------
 let AuthLogons =
@@ -110,7 +125,7 @@ SmbNet
 | join kind=leftouter (DnsMap) on RemoteIP
 | extend TargetHost = coalesce(ResolvedHost, RemoteIP)
 
-// correlate SMB traffic → ADMIN$/C$ writes
+// correlate SMB traffic → admin/hidden-share writes
 | join kind=innerunique (
     AdminShareWrites
     | project FileTime, TargetHost, SrcDeviceName = DeviceName, FolderPath, FileName, SHA256
@@ -131,19 +146,41 @@ SmbNet
     | project AuthTime, AccountUPN, IPAddress
 ) on $left.RemoteIP == $right.IPAddress
 
-// -------------------- Behaviour scoring (no TI) --------------------
+// -------------------- Behaviour features (no TI) --------------------
 | extend HasServiceExec = iif(isnotempty(SvcTime), 1, 0)
 | extend IsPsExecStyle =
-    iif(SmbProc == "psexec.exe" or SvcCmd has "psexesvc", 1, 0)
+    iif(SmbProc in ("psexec.exe","psexesvc.exe") or SvcCmd has "psexesvc", 1, 0)
 | extend IsWMICStyle =
-    iif(SmbProc == "wmic.exe" or SvcCmd has "wmic", 1, 0)
+    iif(SmbProc == "wmic.exe" or SvcCmd has "wmic ", 1, 0)
 | extend IsSCExecStyle =
     iif(SmbProc == "sc.exe" or SvcCmd has "sc.exe create" or SvcCmd has "sc.exe start", 1, 0)
 | extend IsPowershellRemoting =
-    iif(SmbProc == "powershell.exe" and SmbCmd has_any ("Invoke-Command","New-PSSession","Enter-PSSession"), 1, 0)
+    iif(SmbProc in ("powershell.exe","pwsh.exe")
+        and SmbCmd has_any ("Invoke-Command","New-PSSession","Enter-PSSession"), 1, 0)
 
 // count unique remote hosts per source (worm / mass propagation)
-| extend HostPropagationCount = dcount(TargetHost) over (DeviceName)
+| summarize
+      FirstSeen = min(SmbTime),
+      LastSeen  = max(SmbTime),
+      HostPropagationCount = dcount(TargetHost),
+      any(RemoteIP),
+      any(SmbProc),
+      any(SmbCmd),
+      any(FolderPath),
+      any(FileName),
+      any(SvcFileName),
+      any(SvcCmd),
+      any(AccountUPN)
+  by SourceDevice = DeviceName
+
+| extend SmbProc            = any_SmbProc,
+         SmbCmd             = any_SmbCmd,
+         RemoteIP           = any_RemoteIP,
+         FolderPath         = any_FolderPath,
+         DroppedFile        = any_FileName,
+         SvcFileName        = any_SvcFileName,
+         SvcCmd             = any_SvcCmd,
+         AccountUPN         = any_AccountUPN
 
 // base behaviour score (80) + technique weights
 | extend ConfidenceScore =
@@ -159,47 +196,51 @@ SmbNet
     ConfidenceScore >= 85, "Medium",
     "Low"
 )
-| extend MITRE_Tactics = "TA0008 (Lateral Movement); TA0002 (Execution)",
-         MITRE_Techniques = "T1021.002 (SMB/ADMIN$), T1569.002 (Service Execution), T1078 (Valid Accounts)"
+| extend MITRE_Tactics =
+    "TA0008 (Lateral Movement); TA0002 (Execution)",
+         MITRE_Techniques =
+    "T1021.002 (SMB/ADMIN$), T1569.002 (Service Execution), T1078 (Valid Accounts)"
 
 // -------------------- Hunter directives --------------------
 | extend ThreatHunterDirectives = strcat(
     "Severity=", Severity,
-    "; SourceDevice=", DeviceName,
-    "; TargetHost=", TargetHost,
+    "; SourceDevice=", SourceDevice,
+    "; RemoteIP=", tostring(RemoteIP),
+    "; HostPropagationCount=", tostring(HostPropagationCount),
     "; SMBProc=", SmbProc,
-    "; PropagationCount=", tostring(HostPropagationCount),
+    "; DroppedFile=", DroppedFile,
     "; RecommendedNextSteps=",
     case(
         Severity == "High",
-            "Treat as likely active lateral movement or worm-like propagation. Immediately review full process tree on the source host, validate the account used for SMB connections (from SigninLogs), inspect the dropped binary on ADMIN$/C$ for malware, and consider isolating the source host. Check for additional lateral movement (WinRM, RDP, SMB to other subnets).",
+            "Active lateral movement or worm-like propagation is likely. Pull full process tree on source host, inspect dropped binaries on admin/hidden shares, validate account usage from SigninLogs, and consider isolating the source. Pivot for SMB/WinRM/RDP activity from this host.",
         Severity == "Medium",
-            "Validate whether the SMB/ADMIN$ activity is part of legitimate IT remote administration. Review service creation on the target host, confirm the operator and change ticket, and pivot across other devices contacted by the same source with HostPropagationCount.",
-        "Use as a hunting signal. Baseline known-good remote admin behaviour and adjust propagation_threshold and procSet accordingly."
+            "Confirm if this is sanctioned remote admin behaviour. Validate operator, change records, and service creation on targets. Tune procSet and share patterns for known-good tooling.",
+        "Treat as a hunting lead. Baseline normal remote admin workflows and adjust thresholds; escalate if seen alongside other lateral-movement signals."
     )
 )
 
 // -------------------- Final projection --------------------
+| where ConfidenceScore >= 85   // focus on Medium+ by default; tune as needed
 | project
-    SmbTime,
-    SourceDevice = DeviceName,
+    FirstSeen,
+    LastSeen,
+    SourceDevice,
     RemoteIP,
-    TargetHost,
+    HostPropagationCount,
     FolderPath,
-    DroppedFile = FileName,
+    DroppedFile,
     SmbProc,
     SmbCmd,
     SvcFileName,
     SvcCmd,
     AccountUPN,
-    HostPropagationCount,
     ConfidenceScore,
     Severity,
     MITRE_Tactics,
     MITRE_Techniques,
     ThreatHunterDirectives
-| where ConfidenceScore >= 85   // focus on Medium+ by default; tune as needed
-| order by ConfidenceScore desc, SmbTime desc
+| order by ConfidenceScore desc, LastSeen desc
+
 
 ```
 
