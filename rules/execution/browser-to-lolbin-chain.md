@@ -63,43 +63,28 @@ let LOLBINs = dynamic([
     "cmd.exe", "certutil.exe", "bitsadmin.exe", "msiexec.exe"
 ]);
 
-// -------------------------------------------
-// 2. Select LOLBIN executions
-// -------------------------------------------
-let LolbinExec =
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
+
+// -------------------------------------------
+// 2. Direct browser → LOLBIN chains
+// -------------------------------------------
 | where FileName in~ (LOLBINs)
-| extend Cmd = tostring(ProcessCommandLine);
+| where InitiatingProcessFileName in~ (Browsers)
+
+// For convenience
+| extend BrowserProc = InitiatingProcessFileName,
+         BrowserCommandLine = InitiatingProcessCommandLine,
+         Cmd = tostring(ProcessCommandLine)
 
 // -------------------------------------------
-// 3. Select browser-origin executions (pivot on parents)
-// -------------------------------------------
-let BrowserParents =
-DeviceProcessEvents
-| where Timestamp >= ago(lookback)
-| where FileName in~ (Browsers)
-| project ParentTime = Timestamp,
-          DeviceId, DeviceName,
-          BrowserProc = FileName,
-          BrowserCommandLine = ProcessCommandLine,
-          InitiatingProcessId = ProcessId;
-
-// -------------------------------------------
-// 4. Join LOLBIN executions to browser parents
-// -------------------------------------------
-LolbinExec
-| join kind=leftouter BrowserParents on DeviceId
-| where ParentTime <= Timestamp
-      and Timestamp <= ParentTime + 5m // chain window
-| extend FromBrowser = iif(isnotempty(BrowserProc), 1, 0)
-
-// -------------------------------------------
-// 5. Deep behavior scoring
+// 3. Deep behaviour scoring
 // -------------------------------------------
 
 // Encoded/obfuscated payloads
 | extend HasEncoded = Cmd has_any ("-enc ", "-encodedcommand", "-e ")
+
+// Base64 indicators
 | extend HasBase64 = Cmd has_any ("FromBase64String", " JAB", "SQBvAHUAdA")
 
 // Staged script execution
@@ -109,11 +94,11 @@ LolbinExec
 | extend HasCradle =
       Cmd has_any ("iwr", "Invoke-WebRequest", "curl ", "wget ", "Invoke-RestMethod")
 
-// Suspicious file origin (downloaded stuff)
+// Suspicious file origin (paths in command line)
 | extend HasDownloadPath =
-      FolderPath has_any (@"\Users\", @"\Downloads\", @"\AppData\", @"\Temp\")
+      Cmd has_any (@"\Users\", @"\Downloads\", @"\AppData\", @"\Temp\")
 
-// Secondary LOLBIN chains (rundll32 → powershell, etc.)
+// Secondary LOLBIN chains (rundll32 → powershell etc. in same cmdline)
 | extend ChildIsLOLChain =
       Cmd has_any ("javascript:", "vbscript:", "mshta", "regsvr32 /s", "rundll32")
 
@@ -124,31 +109,31 @@ LolbinExec
 // Weighted scoring
 | extend ConfidenceScore =
       0
-      + iif(FromBrowser == 1, 4, 0)                                // browser to LOLBIN
-      + iif(HasEncoded, 3, 0)                                      // encoded command
-      + iif(HasBase64, 2, 0)                                       // base64 payload
-      + iif(HasCradle, 3, 0)                                       // download cradle
-      + iif(HasIEX, 3, 0)                                          // inline execution
-      + iif(HasDefenseTamper, 3, 0)                                // tampering
-      + iif(HasDownloadPath, 2, 0)                                 // downloaded file origin
-      + iif(ChildIsLOLChain, 3, 0);                                // LOLBIN → LOLBIN chaining
+      + 4                                                   // browser → LOLBIN base weight
+      + iif(HasEncoded,        3, 0)                        // encoded command
+      + iif(HasBase64,         2, 0)                        // base64 payload
+      + iif(HasCradle,         3, 0)                        // download cradle
+      + iif(HasIEX,            3, 0)                        // inline execution
+      + iif(HasDefenseTamper,  3, 0)                        // tampering
+      + iif(HasDownloadPath,   2, 0)                        // downloaded file origin
+      + iif(ChildIsLOLChain,   3, 0);                       // LOLBIN → LOLBIN chaining
 
 // -------------------------------------------
-// 6. Reason summary
+// 4. Reason summary
 // -------------------------------------------
 | extend Reason = strcat(
-      iif(FromBrowser == 1, "Browser-origin execution; ", ""),
-      iif(HasEncoded, "Encoded payload; ", ""),
-      iif(HasBase64, "Base64 payload; ", ""),
-      iif(HasCradle, "Download cradle invoked; ", ""),
-      iif(HasIEX, "IEX/inline execution; ", ""),
-      iif(ChildIsLOLChain, "LOLBIN-to-LOLBIN chaining; ", ""),
+      "Browser-origin LOLBIN execution; ",
+      iif(HasEncoded,       "Encoded payload; ", ""),
+      iif(HasBase64,        "Base64 payload; ", ""),
+      iif(HasCradle,        "Download cradle; ", ""),
+      iif(HasIEX,           "IEX/inline execution; ", ""),
+      iif(ChildIsLOLChain,  "LOLBIN-to-LOLBIN chaining; ", ""),
       iif(HasDefenseTamper, "Defender tampering attempt; ", ""),
-      iif(HasDownloadPath, "Suspicious download/execution directory; ", "")
+      iif(HasDownloadPath,  "Download / temp path in use; ", "")
 )
 
 // -------------------------------------------
-// 7. Severity
+// 5. Severity
 // -------------------------------------------
 | extend Severity = case(
       ConfidenceScore >= 12, "High",
@@ -158,7 +143,7 @@ LolbinExec
 )
 
 // -------------------------------------------
-// 8. L3 Hunting Directives
+// 6. L3 Hunting Directives
 // -------------------------------------------
 | extend HuntingDirectives = strcat(
     "Severity=", Severity,
@@ -170,25 +155,26 @@ LolbinExec
     "; RecommendedNextSteps=",
     case(
         Severity == "High",
-           "Investigate full process tree. Extract downloaded file if any. Review browser history and downloads. Check for credential harvesting scripts, LSASS access, persistence creation. Isolate if malicious.",
+           "Investigate full process tree. Extract any downloaded payload. Review browser history and downloads. Check for credential harvesting, LSASS access, and persistence. Isolate if malicious.",
         Severity == "Medium",
-           "Review downloaded content and command-line arguments. Check email/URL origin. Inspect ±24h for related alerts.",
+           "Review downloaded content and command-line arguments. Correlate with email/URL origin. Inspect ±24h for related alerts.",
         Severity == "Low",
-           "Baseline if known admin tools triggered it. Validate user activity.",
-        "Context only."
+           "Baseline if known admin/testing activity. Validate user context and source URL.",
+        "Use as contextual signal only; correlate with higher-confidence detections."
     )
 )
 
 // -------------------------------------------
-// 9. Final output
+// 7. Final output
 // -------------------------------------------
+| where ConfidenceScore >= 5
 | project Timestamp, DeviceId, DeviceName, AccountName,
           BrowserProc, BrowserCommandLine,
           FileName, Cmd, FolderPath,
           ConfidenceScore, Severity,
           Reason, HuntingDirectives
-| where ConfidenceScore >= 5
 | order by Timestamp desc
+
 ```
 
 The query exposes:
