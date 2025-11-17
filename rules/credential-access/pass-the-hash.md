@@ -51,131 +51,95 @@ This detection is fully native, environment-aware after tuning, and provides rel
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// ============================================================
-// Pass-the-Hash (NTLM Network Lateral) — L3 Native (Noise Reduced)
-// Category: credential-access / lateral-movement
-// MITRE: T1550.002 (Pass-the-Hash), T1078 (Valid Accounts)
-// Author: Ala Dabat (Alstrum)
-// ============================================================
+// Pass-the-Hash (NTLM Lateral Movement) — L3 Native
+// MITRE: T1550.002, T1078
+// Author: Ala Dabat | 2025-11
 
 let lookback = 14d;
 
-// Optional exclusions for legitimate admin / automation systems
-let KnownAdminHosts = dynamic([
-    // "jump01", "jump02", "backup01", "sccm01"
-]);
+let KnownAdminHosts = dynamic([]);
+let HighValueNames  = dynamic(["admin","administrator","adm","svc","service","sql","backup","oracle","krbtgt"]);
 
-// High-value account indicators
-let HighValueAccountPatterns = dynamic([
-    "admin","administrator","adm","service","svc","sql","backup","oracle","krbtgt"
-]);
-
-// 1. Raw NTLM network logons (IdentityLogonEvents)
+// 1 — Raw NTLM network logons
 let Ntls =
 IdentityLogonEvents
 | where Timestamp >= ago(lookback)
-| where LogonType == "Resource Access"           // NTLM network logon semantics
+| where LogonType == "Resource Access"
 | where Protocol has "NTLM"
-| where isnotempty(DeviceName)
-| where isnotempty(TargetDeviceName)
-| where DeviceName != TargetDeviceName           // eliminate local chatter
-| where DeviceName !in (KnownAdminHosts)         // reduce noise from known admin hosts
-| where TargetDeviceName !endswith "$"           // filter machine account targets
-| where AccountName !endswith "$"                // filter machine accounts unless noisy
-| extend ClientHost = DeviceName,
-         TargetHost = TargetDeviceName,
-         UPN        = AccountUpn,
-         UName      = AccountName;
+| where isnotempty(DeviceName) and isnotempty(TargetDeviceName)
+| where DeviceName != TargetDeviceName
+| where DeviceName !in (KnownAdminHosts)
+| where TargetDeviceName !endswith "$"
+| where AccountName !endswith "$"
+| extend Client = DeviceName,
+         Target = TargetDeviceName,
+         User   = AccountName,
+         UPN    = AccountUpn;
 
-// 2. Aggregate client → target behaviour
+// 2 — Cluster client → target behaviour
 let Clusters =
 Ntls
-| summarize
-    FirstSeen     = min(Timestamp),
-    LastSeen      = max(Timestamp),
-    Events        = count(),
-    UniqueTargets = dcount(TargetHost),
-    TargetSample  = take_any(TargetHost),
-    TargetList    = make_set(TargetHost, 20)
-  by ClientHost, UPN, UName;
+| summarize FirstSeen=min(Timestamp),
+            LastSeen=max(Timestamp),
+            Events=count(),
+            UniqueTargets=dcount(Target),
+            Targets=make_set(Target,20),
+            ExampleTarget=any(Target)
+  by Client, User, UPN;
 
-// 3. Noise reduction filters
+// 3 — Noise reduction
 Clusters
-| where UniqueTargets >= 2              // single target is usually normal
-| where Events >= 5                     // remove trivial noise
-| where ClientHost !in (KnownAdminHosts)
+| where Events >= 5
+| where UniqueTargets >= 2
+| where Client !in (KnownAdminHosts)
 | extend DurationMin = datetime_diff("minute", LastSeen, FirstSeen)
 
-// 4. Suspicion heuristics
-| extend IsHighValueAccount =
-    iif(UName has_any (HighValueAccountPatterns)
-        or UPN  has_any (HighValueAccountPatterns), 1, 0)
+// 4 — Suspicious conditions
+| extend HighValueUser   = User has_any (HighValueNames) or UPN has_any (HighValueNames),
+         ManyTargets     = UniqueTargets >= 5,
+         MediumTargets   = UniqueTargets between (2 .. 4),
+         ShortBurst      = DurationMin <= 30 and Events >= 10
 
-| extend Susp_ManyTargets   = iif(UniqueTargets >= 5, 1, 0)
-| extend Susp_MediumTargets = iif(UniqueTargets between (2 .. 4), 1, 0)
-| extend Susp_ShortBurst    = iif(DurationMin <= 30 and Events >= 10, 1, 0)
-| extend Susp_HighValue     = iif(IsHighValueAccount == 1, 1, 0)
+// 5 — Light scoring (noise-aware)
+| extend Score =
+      iif(ManyTargets,   4, 0) +
+      iif(MediumTargets, 2, 0) +
+      iif(ShortBurst,    2, 0) +
+      iif(HighValueUser, 3, 0)
 
-// 5. Confidence scoring (noise-aware)
-| extend ConfidenceScore =
-    0
-    + iif(Susp_ManyTargets == 1,    5, 0)
-    + iif(Susp_MediumTargets == 1,  3, 0)
-    + iif(Susp_ShortBurst == 1,     3, 0)
-    + iif(Susp_HighValue == 1,      4, 0)
-
-// 6. Reasoning text
-| extend Reason = strcat(
-    iif(Susp_ManyTargets == 1, 
-        strcat("NTLM sweep across ", tostring(UniqueTargets), " hosts. "), ""),
-    iif(Susp_MediumTargets == 1,
-        strcat("Multiple NTLM connections (", tostring(UniqueTargets), "). "), ""),
-    iif(Susp_ShortBurst == 1,
-        strcat("Short-burst NTLM cluster (", tostring(DurationMin),
-               " minutes, ", tostring(Events), " events). "), ""),
-    iif(Susp_HighValue == 1,
-        "High-value account performing NTLM lateral movement. ", "")
-)
-
-// 7. Severity mapping
+// 6 — Severity
 | extend Severity = case(
-    ConfidenceScore >= 10, "High",
-    ConfidenceScore >= 6,  "Medium",
-    ConfidenceScore >= 3,  "Low",
-    "Informational"
+      Score >= 8, "High",
+      Score >= 5, "Medium",
+      Score >= 3, "Low",
+      "Informational"
 )
 
-// 8. Hunter directives
-| extend HuntingDirectives = strcat(
-    "Severity=", Severity,
-    "; ClientHost=", ClientHost,
-    "; Account=", UPN,
-    "; UniqueTargets=", tostring(UniqueTargets),
-    "; ExampleTarget=", TargetSample,
-    "; Reason=", Reason,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High",
-            "Likely Pass-the-Hash. Immediately analyze LSASS access, isolate client host, review recent lateral movement, and confirm privilege use.",
-        Severity == "Medium",
-            "Investigate the client host; verify if privileged NTLM usage is expected. Review recent tool execution, service creation, or SMB/WMI pivots.",
-        Severity == "Low",
-            "Validate if this could be normal admin behaviour. Tune out known patterns.",
-        "Baseline-only; correlate with other lateral movement indicators."
-    )
+// 7 — Analyst summary
+| extend Reason = strcat(
+      iif(ManyTargets,   tostring(UniqueTargets)  , ""),
+      iif(ManyTargets,   " targets touched via NTLM. ", ""),
+      iif(MediumTargets, "Multiple NTLM targets. ",    ""),
+      iif(ShortBurst,    "Short burst of NTLM logons. ", ""),
+      iif(HighValueUser, "High-value account involved. ", "")
 )
 
-// 9. Final output
-| where ConfidenceScore >= 3
-| project
-    FirstSeen, LastSeen, DurationMin,
-    ClientHost,
-    UPN, UName,
-    Events, UniqueTargets,
-    TargetSample, TargetList,
-    ConfidenceScore, Severity,
-    Reason, HuntingDirectives
-| order by ConfidenceScore desc, LastSeen desc
+// 8 — Directives
+| extend Directives = case(
+      Severity == "High",
+        "Likely Pass-the-Hash. Review LSASS access on client host, isolate if necessary, pivot for SMB/WMI/WinRM activity, inspect recent privilege use.",
+      Severity == "Medium",
+        "Validate if the account normally touches multiple hosts. Check admin tools, service accounts, SCCM, scanning tools.",
+      "Baseline check. Tune out known admin patterns."
+)
+
+// 9 — Output
+| where Score >= 3
+| project FirstSeen, LastSeen, DurationMin,
+          Client, User, UPN,
+          Events, UniqueTargets, ExampleTarget, Targets,
+          Score, Severity, Reason, Directives
+| order by Score desc, LastSeen desc
 
 ```
 
