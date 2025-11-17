@@ -17,84 +17,60 @@ File Timestomping Behaviour is detected using pure native telemetry (no external
 // =====================================================================
 
 let lookback = 14d;
+
 DeviceFileEvents
 | where Timestamp >= ago(lookback)
 
-// Only files where MDE captured *previous* timestamps
-| where isnotempty(PreviousFileCreationTime) 
-   or isnotempty(PreviousFileModificationTime)
+// Only evaluate entries where MDE recorded *previous* timestamps
+| where isnotempty(PreviousFileCreationTime)
+       or isnotempty(PreviousFileModificationTime)
 
-// -----------------------------------------------------------
-//  Detect timestamp **rollback** (backdating)
-// -----------------------------------------------------------
-| extend CreationRollback = 
-    (datetime_diff("minute", FileCreationTime, PreviousFileCreationTime) < -10)
+// --- 1. Direct timestamp rollback (backdating)
+| extend CreationRollback =
+        datetime_diff("minute", FileCreationTime, PreviousFileCreationTime) < -10,
+         ModificationRollback =
+        datetime_diff("minute", FileModificationTime, PreviousFileModificationTime) < -10
 
-| extend ModificationRollback =
-    (datetime_diff("minute", FileModificationTime, PreviousFileModificationTime) < -10)
+// --- 2. Large timestamp discontinuity (>7 days from event time)
+| extend CreationDeltaHours      = abs(datetime_diff("hour", FileCreationTime, Timestamp)),
+         ModificationDeltaHours  = abs(datetime_diff("hour", FileModificationTime, Timestamp)),
+         SuspiciousDelta         = CreationDeltaHours > 168 or ModificationDeltaHours > 168
 
-// -----------------------------------------------------------
-//  Detect abnormal timestamp deltas (jump forward/backwards strongly)
-// -----------------------------------------------------------
-| extend CreationDelta = abs(datetime_diff("hour", FileCreationTime, Timestamp))
-| extend ModificationDelta = abs(datetime_diff("hour", FileModificationTime, Timestamp))
-
-| extend SuspiciousDelta = CreationDelta > 168 or ModificationDelta > 168  // > 7 days difference
-
-// -----------------------------------------------------------
-//  Score the behaviour
-// -----------------------------------------------------------
-| extend BehaviourScore =
-      (iif(CreationRollback, 4, 0))
-    + (iif(ModificationRollback, 4, 0))
-    + (iif(SuspiciousDelta, 2, 0))
-
-| where BehaviourScore >= 3   // ignore noise
-
-| extend ConfidenceScore = BehaviourScore
+// --- 3. Severity mapping (behaviour-based)
 | extend Severity = case(
-    ConfidenceScore >= 8, "High",
-    ConfidenceScore >= 5, "Medium",
-    ConfidenceScore >= 3, "Low",
-    "Informational"
+        CreationRollback and ModificationRollback, "High",
+        CreationRollback or ModificationRollback,  "Medium",
+        SuspiciousDelta,                           "Low",
+        "Informational"
 )
+| where Severity in ("High","Medium","Low")   // reduce noise
 
-// -----------------------------------------------------------
-//  Hunting Directives (L3 Triage Guidance)
-// -----------------------------------------------------------
+// --- 4. L3 analyst guidance
 | extend HuntingDirectives = strcat(
-    "[TimestompingDetection] ",
     "Severity=", Severity,
     "; Device=", DeviceName,
     "; User=", AccountName,
     "; Indicators=",
-        case(CreationRollback, "CreationRollback;", ""),
-        case(ModificationRollback, "ModificationRollback;", ""),
-        case(SuspiciousDelta, "LargeDelta;", ""),
-    " | NextSteps=",
-    case(
-        Severity == "High",
-        "Isolate host, triage for anti-forensics activity, inspect recent process creations, correlate with malware staging, investigate attacker cleanup operations.",
-
-        Severity == "Medium",
-        "Validate legitimate installer/patch operations, pivot by hash and filename, check for related file writes or deletes.",
-
-        Severity == "Low",
-        "Rare benign scenario (installer rollbacks). Baseline or tune if recurring.",
-
-        "Correlation-only signal."
-    )
+        iif(CreationRollback,      "CreationRollback;",      ""),
+        iif(ModificationRollback,  "ModificationRollback;",  ""),
+        iif(SuspiciousDelta,       "LargeTimestampDelta;",   ""),
+    "; NextSteps=",
+        case(
+            Severity == "High",
+                "Strong timestomping signal. Investigate anti-forensics behaviour. Pivot to recent process launches, file renames/deletes, and malware staging activity. Consider containment.",
+            Severity == "Medium",
+                "Review installer/patch context. Check file ancestry, correlate with process actions and recent writes. Validate expected admin or software update behaviour.",
+            "Likely benign but unusual. Baseline if recurring; keep under watch if seen with other suspicious events."
+        )
 )
 
-// -----------------------------------------------------------
-//  Output
-// -----------------------------------------------------------
+// --- 5. Output
 | project Timestamp, DeviceId, DeviceName, AccountName,
           FileName, FolderPath,
           FileCreationTime, PreviousFileCreationTime,
           FileModificationTime, PreviousFileModificationTime,
           CreationRollback, ModificationRollback, SuspiciousDelta,
-          ConfidenceScore, Severity, HuntingDirectives
+          Severity, HuntingDirectives
 | order by Timestamp desc
 
 ```
