@@ -10,46 +10,115 @@ Modern LOLBIN – Winget Package Abuse is detected using pure native telemetry (
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
+// =====================================================================
+//  Suspicious Winget Execution (Non-Microsoft Sources / Silent Install)
+//  MITRE: T1105 (Ingress Tool Transfer), T1059, T1218
+//  Author: Ala Dabat — 2025 LOLBAS / Installer Abuse Pack
+// =====================================================================
+
 let lookback = 14d;
+
 DeviceProcessEvents
 | where Timestamp >= ago(lookback)
 | where FileName =~ "winget.exe"
-| extend Cmd = tostring(ProcessCommandLine)
-| extend IsCustomSource = iif(Cmd has_any ("--source","-s") and Cmd has_any ("http://","https://") and Cmd !has "microsoft", 1, 0)
-| extend IsSilentInstall = iif(Cmd has_any ("--silent","--accept-package-agreements","--accept-source-agreements"), 1, 0)
-| extend ConfidenceScore =
-    iif(IsCustomSource == 1 and IsSilentInstall == 1, 9,
-    iif(IsCustomSource == 1, 7,
-    iif(IsSilentInstall == 1, 5, 3)))
-| extend Reason = strcat("Winget invocation: ", Cmd,
-                         iif(IsCustomSource == 1, " using custom/non-Microsoft source.", ""),
-                         iif(IsSilentInstall == 1, " with silent/auto-accept flags.", ""))
-| project Timestamp, DeviceId, DeviceName, AccountName,
-          FileName, Cmd,
-          InitiatingProcessFileName, InitiatingProcessCommandLine,
-          ConfidenceScore, Reason
+| extend Cmd = tostring(ProcessCommandLine),
+         Parent = tostring(InitiatingProcessFileName)
+
+// =====================================================================
+// 1. Behaviour Flags (Winget Abuse)
+// =====================================================================
+
+// Custom source pointing to external repo (non-Microsoft)
+| extend CustomSource =
+       Cmd has_any ("--source","-s")
+       and Cmd has_any ("http://","https://")
+       and Cmd !has "microsoft"
+
+// Silent or auto-agreement flags (common in drive-by installs)
+| extend SilentInstall =
+       Cmd has_any ("--silent","--accept-package-agreements","--accept-source-agreements")
+
+// Installation of arbitrary package from external source
+| extend ExternalInstall =
+       CustomSource
+       and Cmd has_any ("install","--install","-i")
+
+// Temp / user-directory staging paths (payload landing zones)
+| extend TempExec =
+       Cmd has_any (@"\Users\", @"\AppData\", @"\Temp\")
+
+// Suspicious parent (phishing / LOLBIN chain / browser / script host)
+| extend SuspiciousParent =
+       Parent in~ ("chrome.exe","msedge.exe","firefox.exe","iexplore.exe",
+                   "outlook.exe","winword.exe","excel.exe","wscript.exe",
+                   "cscript.exe","mshta.exe","pwsh.exe","powershell.exe")
+
+// =====================================================================
+// 2. Severity Mapping (Behaviour → Severity, no scoring)
+// =====================================================================
 
 | extend Severity = case(
-    ConfidenceScore >= 8, "High",
-    ConfidenceScore >= 5, "Medium",
-    ConfidenceScore >= 3, "Low",
-    "Informational"
-)
+
+        // High: install from external source + silent flags → drive-by tool dropper
+        (ExternalInstall and SilentInstall)
+        or (CustomSource and SuspiciousParent)
+        or (CustomSource and TempExec),
+        "High",
+
+        // Medium: external source OR silent install from unknown context
+        CustomSource or SilentInstall,
+        "Medium",
+
+        // Low: winget invoked but no signs of malicious behaviour
+        true,
+        "Low"
+    )
+
+| where Severity in ("High","Medium","Low")
+
+// =====================================================================
+// 3. Analyst Reason (Full Detail)
+// =====================================================================
+
+| extend Reason = strcat(
+      "Winget execution detected. ",
+      iif(CustomSource,   "Non-Microsoft source used. ", ""),
+      iif(SilentInstall,  "Silent/auto-agreement flags detected. ", ""),
+      iif(ExternalInstall,"External package install request. ", ""),
+      iif(SuspiciousParent,"Suspicious parent process. ", ""),
+      iif(TempExec,       "Temp/AppData staging path referenced. ", "")
+    )
+
+// =====================================================================
+// 4. L3 Analyst Directives
+// =====================================================================
+
 | extend HuntingDirectives = strcat(
     "Severity=", Severity,
-    "; Device=", tostring(DeviceName),
-    "; User=", tostring(AccountName),
-    "; CoreReason=", Reason,
-    "; RecommendedNextSteps=",
-    case(
-        Severity == "High", "Isolate host, collect full triage (process, file, network, identity), check for lateral movement and credential theft, notify IR lead.",
-        Severity == "Medium", "Validate admin/change context, pivot ±24h on the same device/user, correlate with other detections, decide on containment.",
-        Severity == "Low", "Baseline this behaviour for this asset/user, treat as a weak hunting signal, consider tuning or elevating if seen with other anomalies.",
-        "Use as contextual signal only; combine with higher-confidence rules."
-    )
+    "; Device=", DeviceName,
+    "; User=", AccountName,
+    "; Parent=", Parent,
+    "; Reason=", Reason,
+    "; NextSteps=",
+        case(
+            Severity == "High",
+                "Likely malicious winget abuse (drive-by install / external package source). Verify parent process (browser, Office, script host). Examine resulting installed binaries. Isolate host if malicious.",
+            Severity == "Medium",
+                "Review the winget command. Confirm whether external package sources are approved. Check user’s activity and verify package integrity.",
+            "Low-confidence signal. Baseline legitimate winget usage in the environment; tune for known admin workflows."
+        )
 )
-| where ConfidenceScore >= 3
+
+// =====================================================================
+// 5. Output
+// =====================================================================
+
+| project Timestamp, DeviceId, DeviceName, AccountName,
+          FileName, Cmd, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          Severity, Reason, HuntingDirectives
 | order by Timestamp desc
+
 ```
 
 The query exposes:
