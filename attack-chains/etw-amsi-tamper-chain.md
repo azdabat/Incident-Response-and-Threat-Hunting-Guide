@@ -1,4 +1,4 @@
-# 🛡️ ETW / AMSI Tampering Behaviour (T1055.001 / T1089)
+#  ETW / AMSI Tampering Behaviour (T1055.001 / T1089)
 
 **Explanation:** This playbook analyzes the critical stage in an attack where the adversary attempts to disable or bypass host defenses, specifically **Event Tracing for Windows (ETW)** or the **Antimalware Scan Interface (AMSI)**. This technique is a high-confidence indicator of **Defense Evasion (T1055.001, Process Injection)** and is often achieved via memory manipulation (hooking, unhooking, or patching), which serves as the most reliable **Anchor Point** for detection, as it must occur before the final payload executes.
 
