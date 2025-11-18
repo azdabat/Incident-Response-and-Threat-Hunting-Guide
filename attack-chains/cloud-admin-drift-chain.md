@@ -1,4 +1,4 @@
-# ☁️ Cloud Admin Role Drift / Escalation (T1098.003 / T1538.003)
+#  Cloud Admin Role Drift / Escalation (T1098.003 / T1538.003)
 
 **Explanation:** This playbook analyzes how an adversary exploits weak permissions or stolen credentials to gain unauthorized access, leading to **Cloud Role Drift or Escalation**. The attack chain is anchored on an Identity and Access Management (IAM) event where a principal (user, service, or role) modifies its own or another principal's permissions (T1098.003, Account Manipulation) or uses compromised session tokens to assume a high-privilege role (T1538.003, Cloud Compute Infrastructure Actions). This is the key pivot point to escalate privileges and establish persistence.
 
