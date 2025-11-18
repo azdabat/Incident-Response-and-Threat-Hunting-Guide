@@ -1,4 +1,4 @@
-# 📦 Archive-based Data Staging (T1560.001) Attack Chain
+#  Archive-based Data Staging (T1560.001) Attack Chain
 
 **Explanation:** This playbook analyzes the use of legitimate archiving utilities (like **7z.exe**, **WinRar.exe**, or **Rar.exe**) to stage sensitive data. The attacker compresses a large volume of files into a single, often password-protected, archive. This step is a high-confidence precursor to exfiltration, as it minimizes the volume of network transactions and enables **Defense Evasion (T1036)** by concealing the contents. The **Staging** event is the most reliable **Anchor Point** for detection.
 
