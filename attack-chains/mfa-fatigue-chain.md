@@ -1,8 +1,8 @@
-# 🛡️ SOC Investigation Spine: MFA Fatigue / Push Spamming
+#  SOC Investigation Spine: MFA Fatigue / Push Spamming
 
 **Objective:** Anchor the investigation on the detection event (MFA Fatigue) and trace the activity backwards (Initial Access) and forwards (Impact) using security telemetry.
 
-## 🚨 Phase 1: Detection Anchor (MFA Fatigue / Push Spamming)
+##  Phase 1: Detection Anchor (MFA Fatigue / Push Spamming)
 
 This phase identifies the direct evidence of the attack itself.
 
