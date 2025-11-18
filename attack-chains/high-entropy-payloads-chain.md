@@ -1,4 +1,4 @@
-# 💥 High-Entropy Payload Drops (Polymorphic) – T1562.001 / T1027
+#  High-Entropy Payload Drops (Polymorphic) – T1562.001 / T1027
 
 **Explanation:** This playbook analyzes the staging phase where a malicious payload is written to disk, specifically targeting artifacts characterized by **High-Entropy**. High entropy (a measure of randomness) in a file segment or process memory is a high-confidence signature of packed, compressed, or **obfuscated content (T1027)**, used for **Defense Evasion (T1562.001)**. This drop event is the most reliable **Anchor Point** for detection, as it precedes execution.
 
