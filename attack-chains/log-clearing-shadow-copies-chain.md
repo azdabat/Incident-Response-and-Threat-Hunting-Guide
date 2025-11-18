@@ -1,4 +1,4 @@
-# 🧹 Log Clearing and Shadow Copy Deletion – T1070.004 / T1490
+#  Log Clearing and Shadow Copy Deletion – T1070.004 / T1490
 
 **Explanation:** This playbook analyzes the critical post-compromise stages where an adversary attempts to destroy evidence and inhibit recovery. The key **Defense Evasion (T1070.004)** action is **Log Clearing** (erasing Windows Event Logs). The key **Impact (T1490)** action is **Shadow Copy Deletion**, which prevents system restore points from being used against ransomware. The execution of the specific Windows utilities for these tasks serves as the most reliable **Anchor Point** for detection.
 
