@@ -1,4 +1,4 @@
-# 🔑 OAuth Consent Abuse (Native Logs) – T1527: Compromise Infrastructure
+# OAuth Consent Abuse (Native Logs) – T1527: Compromise Infrastructure
 
 **Explanation:** This playbook analyzes a cloud-native attack where an adversary tricks a user into granting high-privilege permissions (Consent) to an attacker-controlled OAuth application. This technique creates a long-lasting, off-network persistence mechanism, allowing the attacker to access resources (Mail, Files) via an Access Token without ever needing the user's password again. The most reliable **Anchor Point** is the security event log showing the **malicious application consent** and the **high-risk permissions** granted.
 
