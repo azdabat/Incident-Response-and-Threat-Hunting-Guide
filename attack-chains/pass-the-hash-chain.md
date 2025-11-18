@@ -1,4 +1,4 @@
-# 🔑 Pass-the-Hash (PtH) Pattern – T1550.002: Lateral Movement
+#  Pass-the-Hash (PtH) Pattern – T1550.002: Lateral Movement
 
 **Explanation:** This playbook analyzes the **Pass-the-Hash (PtH)** technique, a critical lateral movement method where an attacker authenticates to a remote service (like RDP, SMB, or WinRM) using a captured NTLM hash of a user's password instead of the password itself. This is only possible because the NTLM protocol hashes the password *before* sending it over the wire. The most reliable **Anchor Point** is the **successful authentication event** on a target peer system that lacks a corresponding NTLM negotiation (Type 1 or Type 2 messages) or is immediately preceded by the compromised account's hash being dumped.
 
