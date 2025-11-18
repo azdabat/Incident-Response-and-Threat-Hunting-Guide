@@ -1,4 +1,4 @@
-# 🌐 Browser → LOLBIN Execution Chain Analysis (T1204.002)
+#  Browser → LOLBIN Execution Chain Analysis (T1204.002)
 
 **Explanation:** This playbook analyzes the attack chain where a user's interaction within a browser (**T1204.002, User Execution**) triggers the execution of a **Living-Off-the-Land Binary (LOLBIN)**, such as `mshta.exe` or `certutil.exe`. This is a critical **Defense Evasion (T1218)** technique. It abuses trusted, signed Windows executables to perform high-risk actions (downloading, scripting), thereby masking the malicious intent behind a legitimate process. The **LOLBIN Execution** step is the most reliable **Anchor Point** for detection.
 
