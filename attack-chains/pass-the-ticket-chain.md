@@ -1,4 +1,4 @@
-# 🔑 Pass-the-Ticket (PtT) / Kerberos Ticket Abuse – T1558: Lateral Movement
+#  Pass-the-Ticket (PtT) / Kerberos Ticket Abuse – T1558: Lateral Movement
 
 **Explanation:** This playbook analyzes the **Pass-the-Ticket (PtT)** attack, where an adversary steals a valid **Kerberos Ticket Granting Ticket (TGT)** or **Service Ticket (ST)** from memory (LSASS) and reuses it to authenticate to remote services without knowing the user's password. This attack is highly effective and stealthy, as it leverages the trusted Kerberos protocol. The most reliable **Anchor Point** is the successful **extraction of a Kerberos Ticket** from the LSASS process, followed immediately by its **unusual reuse** on a peer system.
 
