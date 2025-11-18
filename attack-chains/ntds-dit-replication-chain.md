@@ -1,8 +1,8 @@
-# 🛡️ SOC Investigation Spine: NTDS.dit Replication / DCSync-like Attack
+#  SOC Investigation Spine: NTDS.dit Replication / DCSync-like Attack
 
 **Objective:** Anchor the investigation on the detection event (DCSync activity) and trace the activity backwards (Initial Access) and forwards (Impact) using security telemetry, focusing on the NTDS.dit theft.
 
-## 🚨 Phase 1: Detection Anchor (NTDS.dit Replication / DCSync)
+##  Phase 1: Detection Anchor (NTDS.dit Replication / DCSync)
 
 This phase identifies the key event where credentials for the entire domain were compromised.
 
