@@ -1,4 +1,4 @@
-# 🔑 LSASS Credential Dumping Behaviour – T1003.001
+#  LSASS Credential Dumping Behaviour – T1003.001
 
 **Explanation:** This playbook analyzes one of the highest-value post-exploitation actions: the theft of credentials from the **Local Security Authority Subsystem Service (LSASS)** process memory. This attack utilizes living-off-the-land techniques (like **`procdump.exe`** or **`taskmgr.exe`**) or tools like Mimikatz to create a dump file. The most reliable **Anchor Point** is the combination of **suspicious process access** to LSASS and the subsequent **creation of a large memory dump file**.
 
