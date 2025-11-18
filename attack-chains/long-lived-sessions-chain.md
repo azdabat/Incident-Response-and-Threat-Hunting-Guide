@@ -1,4 +1,4 @@
-# 📡 Long-Lived External Sessions (Implant-like) – T1105 / T1571
+# Long-Lived External Sessions (Implant-like) – T1105 / T1571
 
 **Explanation:** This playbook focuses on detecting covert C2 activity characterized by **persistent, recurring, or long-duration outbound network connections (T1571, Non-Standard Protocol)** from an internal host to a suspicious external endpoint. This behavior is a strong indicator of a fully established remote access implant (**T1105, Ingress Tool Transfer**), where the **longevity of the session** is the critical **Anchor Point** for detection.
 
