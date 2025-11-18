@@ -1,4 +1,4 @@
-# 📤 Data Exfiltration over HTTPS (Volume Anomaly) – T1041
+#  Data Exfiltration over HTTPS (Volume Anomaly) – T1041
 
 **Explanation:** This playbook analyzes the final stage of an attack where sensitive data is transferred out of the network via an encrypted tunnel (**T1041, Exfiltration Over C2 Channel**). Because HTTPS (Port 443) is common and trusted, the most effective detection **Anchor Point** is the **Volume Anomaly**. This is characterized by an unexpected, high-volume data transfer (e.g., 50MB+) in a short period, originating from a process that is not a standard browser or cloud sync utility.
 
