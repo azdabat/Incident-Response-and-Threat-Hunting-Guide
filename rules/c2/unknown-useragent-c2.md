@@ -10,114 +10,148 @@ Unknown or Rare User-Agent C2 is detected using pure native telemetry (no extern
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// Unknown or Rare User-Agent C2 — L3 Native
+// Unknown or Rare User-Agent C2 — Sentinel / CloudAppEvents
+// Source: CloudAppEvents (Microsoft Defender for Cloud Apps)
 // Author: Ala Dabat | 2025-11
 
-let lookback = 7d;
-let min_ua_count = 5;
-let min_conf = 85;
+let lookback   = 7d;
+let min_ua_cnt = 5;
+let min_conf   = 85;
 
-let UserApps = dynamic([
-    "chrome.exe","msedge.exe","firefox.exe","iexplore.exe","brave.exe",
-    "outlook.exe","teams.exe","slack.exe","zoom.exe","onedrive.exe","dropbox.exe"
-]);
-
-let SuspiciousLaunchers = dynamic([
-    "powershell.exe","pwsh.exe","cmd.exe",
-    "python.exe","perl.exe","ruby.exe","java.exe",
-    "rundll32.exe","mshta.exe","regsvr32.exe",
-    "wscript.exe","cscript.exe","curl.exe","wget.exe",
-    "bitsadmin.exe","rclone.exe","ssh.exe","plink.exe"
-]);
-
+// Substrings commonly seen in custom C2 / tooling User-Agents
 let UAIndicators = dynamic([
     "Go-http-client","Python-urllib","Java","curl","Wget",
     "bot","agent","implant","beacon","stage","loader","update-check","custom"
 ]);
 
-// Stage 1 — raw UA data
+// -------------------------------------------------------------------
+// Stage 1 — Raw events with User-Agent
+// -------------------------------------------------------------------
 let Raw =
-DeviceNetworkEvents
-| where Timestamp >= ago(lookback)
-| where ActionType == "ConnectionSuccess"
-| where RemoteIPType == "Public"
-| where RemotePort in (80,443,8080,8443)
+CloudAppEvents
+| where TimeGenerated >= ago(lookback)
 | where isnotempty(UserAgent)
-| extend Proc = InitiatingProcessFileName,
-         ProcCL = InitiatingProcessCommandLine,
-         ParentProc = InitiatingProcessParentFileName,
-         Account = InitiatingProcessAccountName
-| project Timestamp, DeviceName, RemoteIP, RemotePort, RemoteUrl,
-          UserAgent, Proc, ProcCL, ParentProc, Account;
+| extend
+    EventTime       = TimeGenerated,
+    UserAgentString = UserAgent,
+    UserAccount     = coalesce(AccountDisplayName, AccountId, AccountObjectId),
+    ClientIP        = IPAddress,
+    CloudApp        = Application,
+    Country         = CountryCode,
+    CityName        = City,
+    ISPName         = ISP,
+    OSPlatformName  = OSPlatform
+| project
+    EventTime,
+    UserAccount,
+    ClientIP,
+    CloudApp,
+    UserAgentString,
+    Country,
+    CityName,
+    ISPName,
+    OSPlatformName;
 
-// Stage 2 — UA rarity
+// -------------------------------------------------------------------
+// Stage 2 — UA rarity across the tenant
+// -------------------------------------------------------------------
 let UAStats =
 Raw
-| summarize UA_GlobalCount = count(), DistinctHosts = dcount(DeviceName) by UserAgent;
+| summarize
+      UA_GlobalCount  = count(),
+      DistinctAccounts = dcount(UserAccount),
+      DistinctIPs      = dcount(ClientIP)
+  by UserAgentString;
 
-// Stage 3 — join rarity + classify
+// -------------------------------------------------------------------
+// Stage 3 — Join + classify
+// -------------------------------------------------------------------
 let Enriched =
 Raw
-| join kind=inner UAStats on UserAgent
-| extend IsRareUA = UA_GlobalCount < min_ua_count,
-         HasC2Pattern = UserAgent has_any (UAIndicators),
-         IsSuspiciousLauncher = Proc in (SuspiciousLaunchers),
-         IsUserApp = Proc in (UserApps),
-         UA_Length = strlen(UserAgent),
-         UA_Entropy = strlen(split(UserAgent,";"));    // simple complexity marker
+| join kind=inner UAStats on UserAgentString
+| extend
+    IsRareUA           = UA_GlobalCount < min_ua_cnt,
+    UA_HasC2Indicators = UserAgentString has_any (UAIndicators),
+    UA_Length          = strlen(UserAgentString),
+    UA_TokenCount      = array_length(split(UserAgentString," "));   // rough complexity marker
 
-// Stage 4 — scoring
+// -------------------------------------------------------------------
+// Stage 4 — Behavioural scoring
+// -------------------------------------------------------------------
 let Scored =
 Enriched
-| extend Base = 70
+| extend BaseScore = 70
 | extend Score =
-      Base
-      + iif(IsRareUA, 15, 0)
-      + iif(HasC2Pattern, 10, 0)
-      + iif(IsSuspiciousLauncher, 10, 0)
-      - iif(IsUserApp, 15, 0)
-      + iif(UA_Length < 20, 5, 0)
-      + iif(UA_Length > 180, 5, 0)
-      + iif(UA_Entropy <= 2, 5, 0)
-      + iif(UA_Entropy >= 6, 5, 0)
-| extend Severity = case(
-      Score >= 95, "High",
-      Score >= 85, "Medium",
-      "Low"
-)
-| extend MITRE_Tactics = "TA0011 (Command & Control)",
-         MITRE_Techniques = "T1071 (HTTP/S User-Agent C2)";
+      BaseScore
+      + iif(IsRareUA,           15, 0)   // never/rarely seen UA in tenant
+      + iif(UA_HasC2Indicators, 10, 0)   // contains classic tool / implant markers
+      + iif(UA_Length < 20,      5, 0)   // suspiciously short UA
+      + iif(UA_Length > 180,     5, 0)   // overly long UA (stuffed)
+      + iif(UA_TokenCount <= 2,  5, 0)   // very simple UA structure
+      + iif(UA_TokenCount >= 6,  5, 0);  // very complex UA structure
 
-// Stage 5 — directives
+// Map score → severity
 Scored
-| extend Directives = strcat(
+| extend Severity =
+      case(
+          Score >= 95, "High",
+          Score >= 85, "Medium",
+          "Low"
+      )
+| extend
+    MITRE_Tactics   = "TA0011 (Command and Control)",
+    MITRE_Techniques= "T1071.001 (Web Protocols)"
+
+// -------------------------------------------------------------------
+// Stage 5 — Human directives for the analyst
+// -------------------------------------------------------------------
+| extend AnalystNotes = strcat(
       "Severity=", Severity,
-      "; Host=", DeviceName,
-      "; Proc=", Proc,
-      "; Parent=", ParentProc,
-      "; UserAgent=", UserAgent,
+      "; UserAccount=", coalesce(UserAccount, "<none>"),
+      "; ClientIP=", tostring(ClientIP),
+      "; CloudApp=", tostring(CloudApp),
+      "; UserAgent=", UserAgentString,
       "; RareUA=", tostring(IsRareUA),
+      "; UAIndicators=", tostring(UA_HasC2Indicators),
+      "; UA_GlobalCount=", tostring(UA_GlobalCount),
+      "; DistinctAccounts=", tostring(DistinctAccounts),
+      "; DistinctIPs=", tostring(DistinctIPs),
       "; Score=", tostring(Score),
-      "; Next=",
+      "; RecommendedAction=",
       case(
           Severity == "High",
-              "Likely custom UA beacon. Review process tree, signer, hash. Pivot on RemoteIP and UA across estate. Consider isolation and memory capture.",
+              "Likely custom or tool-based User-Agent. Check if this UA is expected for this app/user/IP. Pivot on UserAgentString and ClientIP across all logs. If unknown, raise an incident, investigate upstream proxy logs and consider containment.",
           Severity == "Medium",
-              "Check if UA belongs to internal or custom app. If not baselined, escalate and pivot to similar UAs.",
-          "Hunting signal. Baselining required."
+              "User-Agent not commonly seen. Validate with app owners or developers. If not recognised, escalate and hunt for similar UAs over a wider time window.",
+          "Weak but interesting hunting signal. Consider baselining or adding to an allowlist if benign."
       )
 )
 
 // Final output
-| project Timestamp, DeviceName, Account, Proc, ParentProc,
-          RemoteIP, RemotePort, RemoteUrl,
-          UserAgent, UA_GlobalCount,
-          IsRareUA, HasC2Pattern, IsSuspiciousLauncher,
-          UA_Length, UA_Entropy,
-          Score, Severity,
-          MITRE_Tactics, MITRE_Techniques, Directives
 | where Score >= min_conf
-| order by Score desc, Timestamp desc
+| project
+    EventTime,
+    UserAccount,
+    ClientIP,
+    CloudApp,
+    Country,
+    CityName,
+    ISPName,
+    OSPlatformName,
+    UserAgentString,
+    UA_GlobalCount,
+    DistinctAccounts,
+    DistinctIPs,
+    IsRareUA,
+    UA_HasC2Indicators,
+    UA_Length,
+    UA_TokenCount,
+    Score,
+    Severity,
+    MITRE_Tactics,
+    MITRE_Techniques,
+    AnalystNotes
+| order by Score desc, EventTime desc
 
 ```
 
