@@ -14,7 +14,8 @@ Long-lived HTTPS tunnels (reverse shells / SOCKS over 443) fronted by powershell
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// Suspicious 443 Beacon Patterns — L3 Native
+
+   // Suspicious 443 Beacon Patterns — L3 Native
 // Author: Ala Dabat | 2025-11
 
 let lookback = 7d;
@@ -48,6 +49,7 @@ DeviceNetworkEvents
 | where RemoteIP !startswith "192.168."
 | where isnotempty(InitiatingProcessFileName)
 | extend OffHours = iif(hour(Timestamp) < 8 or hour(Timestamp) >= 18, 1, 0)
+| extend RemoteDnsName = tostring(RemoteDnsName)  // safe cast, optional
 | project Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort,
           RemoteDnsName, Protocol,
           InitiatingProcessFileName, InitiatingProcessCommandLine,
@@ -62,7 +64,7 @@ Raw
       EventCount=count(),
       DaysActive=dcount(format_datetime(Timestamp,"yyyy-MM-dd")),
       OffHoursEvents=sum(OffHours),
-      RemoteDnsName=any(RemoteDnsName)
+      RemoteDnsName=any(RemoteDnsName)  // optional, only if exists
   by DeviceId, DeviceName, InitiatingProcessFileName,
      InitiatingProcessCommandLine, InitiatingProcessAccountName,
      RemoteIP, RemotePort
@@ -127,7 +129,8 @@ Sess
       "; Events=", tostring(EventCount),
       "; OffHoursRatio=", tostring(OffHoursRatio),
       "; AvgDelta=", tostring(AvgDelta),
-      "; Beacon=", tostring(IsBeacon)
+      "; Beacon=", tostring(IsBeacon),
+      "; DNS=", RemoteDnsName
 )
 | project FirstSeen, LastSeen,
           Host=DeviceName, Account=InitiatingProcessAccountName,
@@ -140,6 +143,7 @@ Sess
           Score, Severity, MITRE_Tactics, MITRE_Techniques, Directives
 | where Score >= min_conf
 | order by Score desc, Duration desc
+
 
 ```
 
