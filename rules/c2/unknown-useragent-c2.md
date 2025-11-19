@@ -10,148 +10,70 @@ Unknown or Rare User-Agent C2 is detected using pure native telemetry (no extern
 ## Advanced Hunting Query (MDE / Sentinel)
 
 ```kql
-// Unknown or Rare User-Agent C2 — Sentinel / CloudAppEvents
-// Source: CloudAppEvents (Microsoft Defender for Cloud Apps)
+// Unknown or Rare HTTPS C2 – MDE Native (Process + JA3 + SNI)
 // Author: Ala Dabat | 2025-11
 
-let lookback   = 7d;
-let min_ua_cnt = 5;
-let min_conf   = 85;
+let Lookback = 7d;
+let MinEvents = 10;
 
-// Substrings commonly seen in custom C2 / tooling User-Agents
-let UAIndicators = dynamic([
-    "Go-http-client","Python-urllib","Java","curl","Wget",
-    "bot","agent","implant","beacon","stage","loader","update-check","custom"
-]);
+// Human-readable process allowlists
+let NormalApps = dynamic(["chrome.exe","msedge.exe","firefox.exe","brave.exe","outlook.exe","teams.exe"]);
+let SuspiciousLaunchers = dynamic(["powershell.exe","pwsh.exe","cmd.exe","python.exe","rundll32.exe","regsvr32.exe","mshta.exe","wscript.exe","cscript.exe","java.exe","curl.exe","wget.exe","rclone.exe"]);
 
-// -------------------------------------------------------------------
-// Stage 1 — Raw events with User-Agent
-// -------------------------------------------------------------------
+// Stage 1: Raw HTTPS traffic
 let Raw =
-CloudAppEvents
-| where TimeGenerated >= ago(lookback)
-| where isnotempty(UserAgent)
-| extend
-    EventTime       = TimeGenerated,
-    UserAgentString = UserAgent,
-    UserAccount     = coalesce(AccountDisplayName, AccountId, AccountObjectId),
-    ClientIP        = IPAddress,
-    CloudApp        = Application,
-    Country         = CountryCode,
-    CityName        = City,
-    ISPName         = ISP,
-    OSPlatformName  = OSPlatform
-| project
-    EventTime,
-    UserAccount,
-    ClientIP,
-    CloudApp,
-    UserAgentString,
-    Country,
-    CityName,
-    ISPName,
-    OSPlatformName;
+DeviceNetworkEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType == "ConnectionSuccess"
+| where RemotePort == 443
+| where isnotempty(InitiatingProcessFileName)
+| extend ProcessName = InitiatingProcessFileName,
+         CommandLine = InitiatingProcessCommandLine,
+         ParentProcess = InitiatingProcessParentFileName,
+         SNI = tostring(NetworkMessageSecurityInfo.SniHostname),
+         JA3 = tostring(NetworkMessageSecurityInfo.Ja3Hash),
+         OffHours = iif(hour(Timestamp) < 8 or hour(Timestamp) >= 18, 1, 0);
 
-// -------------------------------------------------------------------
-// Stage 2 — UA rarity across the tenant
-// -------------------------------------------------------------------
-let UAStats =
+// Stage 2: Session aggregation
+let Agg =
 Raw
-| summarize
-      UA_GlobalCount  = count(),
-      DistinctAccounts = dcount(UserAccount),
-      DistinctIPs      = dcount(ClientIP)
-  by UserAgentString;
+| summarize FirstSeen=min(Timestamp), LastSeen=max(Timestamp), EventCount=count(), UniqueDays=dcount(format_datetime(Timestamp, "yyyy-MM-dd")), OffHoursEvents=sum(OffHours), AnySNI=any(SNI), AnyJA3=any(JA3)
+  by DeviceId, DeviceName, ProcessName, CommandLine, ParentProcess, RemoteIP, RemotePort
+| extend DurationMinutes = datetime_diff("minute", LastSeen, FirstSeen),
+         OffHoursRatio = todouble(OffHoursEvents)/toreal(EventCount)
+| where EventCount >= MinEvents;
 
-// -------------------------------------------------------------------
-// Stage 3 — Join + classify
-// -------------------------------------------------------------------
-let Enriched =
+// Stage 3: Timing deltas (beaconing)
+let Beacon =
 Raw
-| join kind=inner UAStats on UserAgentString
-| extend
-    IsRareUA           = UA_GlobalCount < min_ua_cnt,
-    UA_HasC2Indicators = UserAgentString has_any (UAIndicators),
-    UA_Length          = strlen(UserAgentString),
-    UA_TokenCount      = array_length(split(UserAgentString," "));   // rough complexity marker
+| order by DeviceId asc, ProcessName asc, RemoteIP asc, Timestamp asc
+| extend PrevTime = prev(Timestamp)
+| where isnotempty(PrevTime)
+| extend DeltaSeconds = datetime_diff("second", Timestamp, PrevTime)
+| summarize AvgDelta = avg(DeltaSeconds), StdDelta = stdev(DeltaSeconds), Samples=count()
+  by DeviceId, ProcessName, RemoteIP;
 
-// -------------------------------------------------------------------
-// Stage 4 — Behavioural scoring
-// -------------------------------------------------------------------
-let Scored =
-Enriched
-| extend BaseScore = 70
+// Stage 4: Join + scoring
+Agg
+| join kind=leftouter Beacon on DeviceId, ProcessName, RemoteIP
+| extend IsSuspiciousLauncher = ProcessName in (SuspiciousLaunchers),
+         IsNormalLauncher = ProcessName in (NormalApps),
+         LooksLikeBeacon = Samples >= 5 and AvgDelta between (30 .. 3600) and StdDelta <= AvgDelta * 0.40
 | extend Score =
-      BaseScore
-      + iif(IsRareUA,           15, 0)   // never/rarely seen UA in tenant
-      + iif(UA_HasC2Indicators, 10, 0)   // contains classic tool / implant markers
-      + iif(UA_Length < 20,      5, 0)   // suspiciously short UA
-      + iif(UA_Length > 180,     5, 0)   // overly long UA (stuffed)
-      + iif(UA_TokenCount <= 2,  5, 0)   // very simple UA structure
-      + iif(UA_TokenCount >= 6,  5, 0);  // very complex UA structure
+      70
+      + iif(IsSuspiciousLauncher, 15, 0)
+      - iif(IsNormalLauncher, 15, 0)
+      + iif(LooksLikeBeacon, 15, 0)
+      + iif(OffHoursRatio >= 0.4, 10, 0)
+      + iif(DurationMinutes >= 60, 5, 0)
+      + iif(DurationMinutes >= 240, 5, 0)
+| extend Severity = case(Score >= 95, "High", Score >= 85, "Medium", "Low"),
+         MITRE_Tech = "T1071.001 (Web Protocols)",
+         MITRE_Tactic = "TA0011 (Command & Control)"
+| extend AnalystNotes = strcat("Severity=",Severity,"; Device=",DeviceName,"; Process=",ProcessName,"; Parent=",ParentProcess,"; CommandLine=",CommandLine,"; RemoteIP=",RemoteIP,"; SNI=",AnySNI,"; JA3=",AnyJA3,"; AvgDelta=",AvgDelta,"; Score=",Score)
+| project FirstSeen, LastSeen, DeviceName, ProcessName, ParentProcess, CommandLine, RemoteIP, AnySNI, AnyJA3, DurationMinutes, EventCount, OffHoursRatio, AvgDelta, StdDelta, Samples, LooksLikeBeacon, Score, Severity, MITRE_Tactic, MITRE_Tech, AnalystNotes
+| order by Score desc, DurationMinutes desc
 
-// Map score → severity
-Scored
-| extend Severity =
-      case(
-          Score >= 95, "High",
-          Score >= 85, "Medium",
-          "Low"
-      )
-| extend
-    MITRE_Tactics   = "TA0011 (Command and Control)",
-    MITRE_Techniques= "T1071.001 (Web Protocols)"
-
-// -------------------------------------------------------------------
-// Stage 5 — Human directives for the analyst
-// -------------------------------------------------------------------
-| extend AnalystNotes = strcat(
-      "Severity=", Severity,
-      "; UserAccount=", coalesce(UserAccount, "<none>"),
-      "; ClientIP=", tostring(ClientIP),
-      "; CloudApp=", tostring(CloudApp),
-      "; UserAgent=", UserAgentString,
-      "; RareUA=", tostring(IsRareUA),
-      "; UAIndicators=", tostring(UA_HasC2Indicators),
-      "; UA_GlobalCount=", tostring(UA_GlobalCount),
-      "; DistinctAccounts=", tostring(DistinctAccounts),
-      "; DistinctIPs=", tostring(DistinctIPs),
-      "; Score=", tostring(Score),
-      "; RecommendedAction=",
-      case(
-          Severity == "High",
-              "Likely custom or tool-based User-Agent. Check if this UA is expected for this app/user/IP. Pivot on UserAgentString and ClientIP across all logs. If unknown, raise an incident, investigate upstream proxy logs and consider containment.",
-          Severity == "Medium",
-              "User-Agent not commonly seen. Validate with app owners or developers. If not recognised, escalate and hunt for similar UAs over a wider time window.",
-          "Weak but interesting hunting signal. Consider baselining or adding to an allowlist if benign."
-      )
-)
-
-// Final output
-| where Score >= min_conf
-| project
-    EventTime,
-    UserAccount,
-    ClientIP,
-    CloudApp,
-    Country,
-    CityName,
-    ISPName,
-    OSPlatformName,
-    UserAgentString,
-    UA_GlobalCount,
-    DistinctAccounts,
-    DistinctIPs,
-    IsRareUA,
-    UA_HasC2Indicators,
-    UA_Length,
-    UA_TokenCount,
-    Score,
-    Severity,
-    MITRE_Tactics,
-    MITRE_Techniques,
-    AnalystNotes
-| order by Score desc, EventTime desc
 
 ```
 
