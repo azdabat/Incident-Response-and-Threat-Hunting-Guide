@@ -31,23 +31,29 @@ let UserApps = dynamic([
 let SuspiciousLaunchers = dynamic([
     "powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe",
     "rundll32.exe","regsvr32.exe","mshta.exe","bitsadmin.exe","certutil.exe",
-    "curl.exe","wget.exe","python.exe","perl.exe","ruby.exe","rclone.exe","ssh.exe","plink.exe"
+    "curl.exe","wget.exe","python.exe","perl.exe","ruby.exe","rclone.exe",
+    "ssh.exe","plink.exe"
 ]);
 
-// Stage 1 — raw outbound 443 traffic
+// -------- Stage 1: Raw outbound 443 ----------
 let Raw =
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | where ActionType == "ConnectionSuccess"
 | where RemotePort == 443
-| where RemoteIPType == "Public"
+// Public IPv4/IPv6 filtering (MDE has no "Public" enum)
+| where RemoteIP !in ("127.0.0.1")
+| where RemoteIP !startswith "10."
+| where RemoteIP !startswith "172.16."
+| where RemoteIP !startswith "192.168."
 | where isnotempty(InitiatingProcessFileName)
 | extend OffHours = iif(hour(Timestamp) < 8 or hour(Timestamp) >= 18, 1, 0)
 | project Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort,
-          RemoteUrl, Protocol, InitiatingProcessFileName,
-          InitiatingProcessCommandLine, InitiatingProcessAccountName, OffHours;
+          RemoteDnsName, Protocol,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName, OffHours;
 
-// Stage 2 — aggregate by (host, proc, remote)
+// -------- Stage 2: Session-level aggregation ----------
 let Sess =
 Raw
 | summarize
@@ -56,7 +62,7 @@ Raw
       EventCount=count(),
       DaysActive=dcount(format_datetime(Timestamp,"yyyy-MM-dd")),
       OffHoursEvents=sum(OffHours),
-      RemoteUrl=any(RemoteUrl)
+      RemoteDnsName=any(RemoteDnsName)
   by DeviceId, DeviceName, InitiatingProcessFileName,
      InitiatingProcessCommandLine, InitiatingProcessAccountName,
      RemoteIP, RemotePort
@@ -65,10 +71,10 @@ Raw
 | where EventCount >= min_events
   and Duration >= min_duration;
 
-// Stage 3 — timing deltas
+// -------- Stage 3: Timing deltas ----------
 let Beacon =
 Raw
-| sort by DeviceId, InitiatingProcessFileName, RemoteIP, Timestamp asc
+| order by DeviceId asc, InitiatingProcessFileName asc, RemoteIP asc, Timestamp asc
 | extend PrevT=prev(Timestamp), PrevD=prev(DeviceId),
          PrevP=prev(InitiatingProcessFileName), PrevIP=prev(RemoteIP)
 | where DeviceId == PrevD
@@ -79,7 +85,7 @@ Raw
 | summarize AvgDelta=avg(DeltaSec), StdDelta=stdev(DeltaSec), Samples=count()
   by DeviceId, InitiatingProcessFileName, RemoteIP;
 
-// Stage 4 — join + behaviour scoring
+// -------- Stage 4: Scoring & Enrichment ----------
 Sess
 | join kind=leftouter Beacon
   on DeviceId, InitiatingProcessFileName, RemoteIP
@@ -127,13 +133,13 @@ Sess
           Host=DeviceName, Account=InitiatingProcessAccountName,
           Process=InitiatingProcessFileName,
           ProcessCommandLine=InitiatingProcessCommandLine,
-          RemoteIP, RemotePort, RemoteUrl, Duration, DaysActive,
+          RemoteIP, RemotePort, RemoteDnsName,
+          Duration, DaysActive,
           EventCount, OffHoursRatio, AvgDelta, StdDelta, Samples,
           IsUserApp, IsSuspiciousLauncher, IsBeacon,
           Score, Severity, MITRE_Tactics, MITRE_Techniques, Directives
 | where Score >= min_conf
 | order by Score desc, Duration desc
-
 
 ```
 
