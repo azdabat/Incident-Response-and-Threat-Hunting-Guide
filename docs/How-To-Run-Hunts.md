@@ -1,4 +1,4 @@
-## 🛡️ Comprehensive Threat Hunter's Guide (L2-L3 Analysts)
+## Comprehensive Threat Hunter's Guide (L2-L3 Analysts)
 
 This guide provides a structured approach for Level 2 and Level 3 Security Analysts to conduct proactive threat hunts using **Microsoft 365 Defender (MDE)** and **Microsoft Sentinel**. All hunts are **100% native**, utilizing only the data within the Microsoft security ecosystem, eliminating the need for external Threat Intelligence feeds.
 
