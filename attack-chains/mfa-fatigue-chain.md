@@ -14,7 +14,7 @@ This phase identifies the direct evidence of the attack itself.
 
 ---
 
-## 🔍 Phase 2: Walking Backwards (Initial Access / Execution)
+## Phase 2: Walking Backwards (Initial Access / Execution)
 
 This phase determines how the attacker obtained the initial credential.
 
@@ -26,7 +26,7 @@ This phase determines how the attacker obtained the initial credential.
 
 ---
 
-## 🏃 Phase 3: Walking Forwards (Lateral Movement / Persistence / Staging)
+## Phase 3: Walking Forwards (Lateral Movement / Persistence / Staging)
 
 This phase determines what the attacker did *after* gaining unauthorized access.
 
@@ -38,7 +38,7 @@ This phase determines what the attacker did *after* gaining unauthorized access.
 
 ---
 
-## 💥 Phase 4: Impact and Containment
+##  Phase 4: Impact and Containment
 
 This is the final result of the attack and the immediate response required.
 
