@@ -1,7 +1,5 @@
 # Incident Response Playbook – AI-Driven Polymorphic Payload Drops (High-Entropy)
 
-This playbook addresses advanced threats where malware utilizes AI/ML-driven mutation engines to generate unique, high-entropy payloads for every infection. This defeats traditional signature-based defenses and requires dynamic analysis.
-
 **MITRE ATT&CK Tactic:** Defense Evasion (TA0005), Execution (TA0002)
 **Technique:** T1620 (High-Entropy File/Section), T1055 (Process Injection), T1497 (Virtualization/Sandbox Evasion)
 **Critical Threat:** Malware that changes its file hash and internal structure on *every execution*, preventing static detection and standard IOC blocking.
