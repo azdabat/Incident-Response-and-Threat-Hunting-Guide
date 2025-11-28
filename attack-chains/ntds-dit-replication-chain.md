@@ -14,7 +14,7 @@ This phase identifies the key event where credentials for the entire domain were
 
 ---
 
-## 🔍 Phase 2: Walking Backwards (Initial Access / Execution)
+##  Phase 2: Walking Backwards (Initial Access / Execution)
 
 This phase determines how the attacker obtained the privileges needed to execute the DCSync.
 
@@ -26,7 +26,7 @@ This phase determines how the attacker obtained the privileges needed to execute
 
 ---
 
-## 🏃 Phase 3: Walking Forwards (Lateral Movement / Persistence / Staging)
+##  Phase 3: Walking Forwards (Lateral Movement / Persistence / Staging)
 
 This phase tracks the use of the stolen NTLM hashes (from NTDS.dit) for post-compromise activity.
 
