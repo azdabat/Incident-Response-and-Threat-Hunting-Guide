@@ -28,4 +28,4 @@
 
 1.  **Authentication Failure Spike:** Immediately following the dumping action, look for a spike in **authentication failures** on peer systems, followed by sudden, successful authentication using the **stolen credentials** (Pass-the-Hash/Ticket).
 2.  **File Staging/Exfil:** Network telemetry should be checked for outbound connections from the compromised host, attempting to exfiltrate the newly created, large dump file. This often involves a compressed archive file being uploaded (see the Data Exfiltration playbook).
-3.  **Registry Key:** If Mimikatz was used for persistence, check registry keys associated with authentication, such as the `WDigest` key, which may have been modified.
+3.  **Registry Key:** If malicious tool was used for persistence, check registry keys associated with authentication, such as the `WDigest` key, which may have been modified.
